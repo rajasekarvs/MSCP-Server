@@ -1,573 +1,264 @@
 #!/usr/bin/env python3
-"""
-cowork_trigger_mcp — Production MCP Server
-==========================================
-Triggers Anthropic Cowork workflows via the Claude Managed Agents API.
+"""cowork_trigger_mcp — Production MCP Server for Claude.ai custom connector."""
 
-CORRECT API FLOW (mandatory):
-  1. POST /v1/agents  — create agent ONCE, store agent_id
-  2. POST /v1/sessions — reference agent_id every run
-  3. POST /v1/sessions/{id}/events — send task to running session
-  4. GET  /v1/sessions/{id}/events — poll results
-
-Key rules from official docs:
-  - Sessions take ONLY an agent ID pointer — no inline model/system/tools
-  - agents.create() is a setup step, NOT called per-run
-  - Beta header: managed-agents-2026-04-01
-
-Transport: Streamable HTTP (port 8080) for Render.com deployment
-"""
-
-import json
-import logging
-import os
-import sys
-import contextlib
-from contextlib import asynccontextmanager
+import contextlib, json, logging, os, sys
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, Optional
 
-import httpx
-import uvicorn
+import httpx, uvicorn
 from mcp.server.fastmcp import FastMCP, Context
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
-from starlette.routing import Route, Mount
+from starlette.routing import Route
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Logging
-# ─────────────────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    stream=sys.stderr,
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
-)
+logging.basicConfig(stream=sys.stderr, level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(name)s — %(message)s")
 logger = logging.getLogger("cowork_trigger_mcp")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Config
-# ─────────────────────────────────────────────────────────────────────────────
-ANTHROPIC_API_KEY: str = os.environ.get("ANTHROPIC_API_KEY", "")
-ANTHROPIC_BASE_URL: str = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
-ANTHROPIC_VERSION: str = "2023-06-01"
-MANAGED_AGENTS_BETA: str = "managed-agents-2026-04-01"
-DEFAULT_MODEL: str = os.environ.get("COWORK_DEFAULT_MODEL", "claude-sonnet-4-6")
-MCP_PORT: int = int(os.environ.get("MCP_PORT", "8080"))
-REQUEST_TIMEOUT: float = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "120"))
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+ANTHROPIC_BASE_URL = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+DEFAULT_MODEL = os.environ.get("COWORK_DEFAULT_MODEL", "claude-sonnet-4-6")
+MCP_PORT = int(os.environ.get("MCP_PORT", "8080"))
+REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "120"))
 
 if not ANTHROPIC_API_KEY:
     logger.error("ANTHROPIC_API_KEY is not set.")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HTTP headers
-# ─────────────────────────────────────────────────────────────────────────────
-def _headers() -> Dict[str, str]:
-    return {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": ANTHROPIC_VERSION,
-        "anthropic-beta": MANAGED_AGENTS_BETA,
-        "content-type": "application/json",
-    }
+def _headers():
+    return {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01",
+            "anthropic-beta": "managed-agents-2026-04-01", "content-type": "application/json"}
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Module-level HTTP client (initialized in outer lifespan)
-# ─────────────────────────────────────────────────────────────────────────────
 _http_client: Optional[httpx.AsyncClient] = None
 
 def _client(ctx: Context) -> httpx.AsyncClient:
-    assert _http_client is not None, "HTTP client not initialized — lifespan not running"
+    assert _http_client is not None
     return _http_client
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MCP server (no lifespan — handled by outer Starlette app)
-# ─────────────────────────────────────────────────────────────────────────────
-mcp = FastMCP(
-    "cowork_trigger_mcp",
-    host="0.0.0.0",
-    port=MCP_PORT,
-    streamable_http_path="/",
-)
+mcp = FastMCP("cowork_trigger_mcp", host="0.0.0.0", port=MCP_PORT)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Utilities
-# ─────────────────────────────────────────────────────────────────────────────
-def _utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-def _fmt(data: Any) -> str:
-    return json.dumps(data, indent=2, default=str)
+def _utcnow(): return datetime.now(timezone.utc).isoformat()
 
 def _err(exc: Exception, resource: str = "resource") -> str:
     if isinstance(exc, httpx.HTTPStatusError):
         code = exc.response.status_code
-        try:
-            body = exc.response.json()
-            detail = body.get("error", {}).get("message", exc.response.text[:500])
-        except Exception:
-            detail = exc.response.text[:500]
-        hints = {
-            401: "Check ANTHROPIC_API_KEY is valid.",
-            403: f"API key lacks access to {resource}.",
-            404: f"{resource} not found — verify the ID.",
-            422: f"Invalid request body: {detail}",
-            429: f"Rate limited. Retry after {exc.response.headers.get('retry-after','?')}s.",
-        }
+        try: detail = exc.response.json().get("error", {}).get("message", exc.response.text[:500])
+        except: detail = exc.response.text[:500]
+        hints = {401:"Check ANTHROPIC_API_KEY.", 403:f"No access to {resource}.",
+                 404:f"{resource} not found.", 422:f"Bad request: {detail}",
+                 429:f"Rate limited. Retry after {exc.response.headers.get('retry-after','?')}s."}
         msg = f"Error {code}: {hints.get(code, detail)}"
-        logger.error("API error — %s — full body: %s", msg, exc.response.text[:1000])
-        return msg
-    if isinstance(exc, httpx.TimeoutException):
-        msg = f"Timeout after {REQUEST_TIMEOUT}s — increase REQUEST_TIMEOUT_SECONDS."
-        logger.error(msg)
+        logger.error("API error %s — %s", msg, exc.response.text[:500])
         return msg
     msg = f"Error ({type(exc).__name__}): {str(exc)[:300]}"
-    logger.error("Unexpected error: %s", msg)
-    return msg
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Pydantic models
-# ─────────────────────────────────────────────────────────────────────────────
+    logger.error(msg); return msg
 
 class CreateAgentInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    name: str = Field(..., min_length=3, max_length=100,
-        description="Name for this agent (e.g. 'Sales Report Agent').")
-    system_prompt: str = Field(..., min_length=20, max_length=20000,
-        description="Full system prompt describing the agent's role and behaviour.")
-    model: Optional[str] = Field(default=None,
-        description=f"Anthropic model ID. Defaults to {DEFAULT_MODEL}.")
-
+    name: str = Field(..., min_length=3, max_length=100, description="Agent name.")
+    system_prompt: str = Field(..., min_length=20, max_length=20000, description="System prompt.")
+    model: Optional[str] = Field(default=None, description=f"Model ID. Default: {DEFAULT_MODEL}.")
 
 class StartSessionInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    agent_id: str = Field(..., min_length=5, max_length=128,
-        description="Agent ID from cowork_create_agent (e.g. 'agent_01ABC...'). "
-                    "Create one first — sessions require a pre-created agent.")
-    task: str = Field(..., min_length=10, max_length=8000,
-        description="Natural-language task for the agent to complete. Be specific.")
-    title: Optional[str] = Field(default=None, max_length=200,
-        description="Optional human-readable title for this session.")
-
+    agent_id: str = Field(..., min_length=5, max_length=128, description="Agent ID from cowork_create_agent.")
+    task: str = Field(..., min_length=10, max_length=8000, description="Task to complete.")
+    title: Optional[str] = Field(default=None, max_length=200)
     @field_validator("task")
     @classmethod
-    def task_not_blank(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("task must not be blank.")
+    def not_blank(cls, v):
+        if not v.strip(): raise ValueError("blank")
         return v.strip()
-
 
 class SendEventInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    session_id: str = Field(..., min_length=5, max_length=128,
-        description="Session ID from cowork_start_session.")
-    message: str = Field(..., min_length=1, max_length=8000,
-        description="Follow-up message to steer the running agent.")
-
+    session_id: str = Field(..., min_length=5, max_length=128, description="Session ID.")
+    message: str = Field(..., min_length=1, max_length=8000, description="Message to send.")
 
 class GetSessionInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    session_id: str = Field(..., min_length=5, max_length=128,
-        description="Session ID from cowork_start_session.")
-    max_events: int = Field(default=20, ge=1, le=100,
-        description="Max recent events to return.")
-
+    session_id: str = Field(..., min_length=5, max_length=128, description="Session ID.")
+    max_events: int = Field(default=20, ge=1, le=100)
 
 class ListSessionsInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    agent_id: Optional[str] = Field(default=None,
-        description="Filter by agent ID.")
-    status: Optional[str] = Field(default=None,
-        description="Filter: 'running', 'completed', 'failed', 'interrupted'.")
+    agent_id: Optional[str] = Field(default=None)
+    status: Optional[str] = Field(default=None)
     limit: int = Field(default=20, ge=1, le=100)
-
 
 class ListAgentsInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     limit: int = Field(default=20, ge=1, le=100)
 
-
 class UpdateAgentInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    agent_id: str = Field(..., min_length=5, max_length=128,
-        description="Agent ID to update.")
-    system_prompt: Optional[str] = Field(default=None, max_length=20000,
-        description="New system prompt (creates a new version).")
-    name: Optional[str] = Field(default=None, max_length=100,
-        description="New agent name.")
+    agent_id: str = Field(..., min_length=5, max_length=128)
+    system_prompt: Optional[str] = Field(default=None, max_length=20000)
+    name: Optional[str] = Field(default=None, max_length=100)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tool: cowork_create_agent
-# ─────────────────────────────────────────────────────────────────────────────
-@mcp.tool(
-    name="cowork_create_agent",
-    annotations={"title": "Create Cowork Agent", "readOnlyHint": False},
-)
+@mcp.tool(name="cowork_create_agent", annotations={"title":"Create Cowork Agent"})
 async def cowork_create_agent(params: CreateAgentInput, ctx: Context) -> str:
-    """
-    Create a reusable Managed Agent definition. Do this ONCE and store the
-    returned agent_id — pass it to cowork_start_session for every workflow run.
-    """
+    """Create a Managed Agent. Returns agent_id — store it and pass to cowork_start_session."""
     client = _client(ctx)
-
-    body: Dict[str, Any] = {
-        "name": params.name,
-        "model": params.model or DEFAULT_MODEL,
-        "system": params.system_prompt,
-        "tools": [{"type": "agent_toolset_20260401"}],
-    }
-
-    await ctx.log_info("Creating agent", {"name": params.name})
     try:
-        resp = await client.post("/v1/agents", json=body, headers=_headers())
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:
-        return _err(exc, "Agents API")
+        resp = await client.post("/v1/agents", headers=_headers(), json={
+            "name": params.name, "model": params.model or DEFAULT_MODEL,
+            "system": params.system_prompt, "tools": [{"type": "agent_toolset_20260401"}]})
+        resp.raise_for_status(); data = resp.json()
+    except Exception as exc: return _err(exc, "Agents API")
+    logger.info("Agent created: %s", data.get("id"))
+    return f"## ✅ Agent Created\n- **ID:** `{data.get('id')}`  ← save for cowork_start_session\n- **Name:** {data.get('name')}\n- **Model:** {data.get('model')}"
 
-    agent_id = data.get("id", "")
-    logger.info("Agent created: %s", agent_id)
-
-    return "\n".join([
-        "## ✅ Agent Created",
-        f"- **Agent ID:** `{agent_id}`  ← save this for cowork_start_session",
-        f"- **Name:** {data.get('name')}",
-        f"- **Model:** {data.get('model')}",
-        f"- **Version:** {data.get('version', 1)}",
-        f"- **Created:** {data.get('created_at', _utcnow())}",
-        "",
-        "**Next step:** call `cowork_start_session` with this agent_id.",
-    ])
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tool: cowork_update_agent
-# ─────────────────────────────────────────────────────────────────────────────
-@mcp.tool(
-    name="cowork_update_agent",
-    annotations={"title": "Update Cowork Agent", "readOnlyHint": False},
-)
+@mcp.tool(name="cowork_update_agent", annotations={"title":"Update Cowork Agent"})
 async def cowork_update_agent(params: UpdateAgentInput, ctx: Context) -> str:
-    """
-    Update an existing agent's system prompt or name. Each update creates a new
-    immutable version — existing sessions keep their pinned version.
-    """
+    """Update an agent's name or system prompt. Creates a new version."""
     client = _client(ctx)
-    body: Dict[str, Any] = {}
-    if params.system_prompt:
-        body["system"] = params.system_prompt
-    if params.name:
-        body["name"] = params.name
-
-    if not body:
-        return "Error: Provide at least one of system_prompt or name to update."
-
+    body = {k:v for k,v in {"system":params.system_prompt,"name":params.name}.items() if v}
+    if not body: return "Error: provide system_prompt or name."
     try:
-        resp = await client.post(f"/v1/agents/{params.agent_id}", json=body, headers=_headers())
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:
-        return _err(exc, f"Agent {params.agent_id}")
+        resp = await client.post(f"/v1/agents/{params.agent_id}", headers=_headers(), json=body)
+        resp.raise_for_status(); data = resp.json()
+    except Exception as exc: return _err(exc, f"Agent {params.agent_id}")
+    return f"## ✅ Updated `{params.agent_id}` → version {data.get('version')}"
 
-    return "\n".join([
-        f"## ✅ Agent Updated: `{params.agent_id}`",
-        f"- **New version:** {data.get('version')}",
-        f"- **Updated:** {data.get('updated_at', _utcnow())}",
-        "",
-        "New sessions will use this version. Running sessions keep their pinned version.",
-    ])
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tool: cowork_list_agents
-# ─────────────────────────────────────────────────────────────────────────────
-@mcp.tool(
-    name="cowork_list_agents",
-    annotations={"title": "List Cowork Agents", "readOnlyHint": True},
-)
+@mcp.tool(name="cowork_list_agents", annotations={"title":"List Cowork Agents","readOnlyHint":True})
 async def cowork_list_agents(params: ListAgentsInput, ctx: Context) -> str:
-    """
-    List all Managed Agent definitions in your Anthropic organisation.
-    Use this to find agent IDs before calling cowork_start_session.
-    """
+    """List all registered Managed Agents in your organisation."""
     client = _client(ctx)
     try:
-        resp = await client.get("/v1/agents", headers=_headers(), params={"limit": params.limit})
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:
-        return _err(exc, "Agents API")
-
-    agents: List[Dict[str, Any]] = data.get("data", data.get("agents", []))
-    if not agents:
-        return "No agents found. Create one with cowork_create_agent first."
-
-    lines = [f"## Registered Agents ({len(agents)} found)", ""]
+        resp = await client.get("/v1/agents", headers=_headers(), params={"limit":params.limit})
+        resp.raise_for_status(); data = resp.json()
+    except Exception as exc: return _err(exc, "Agents API")
+    agents = data.get("data", [])
+    if not agents: return "No agents found. Create one with cowork_create_agent."
+    lines = [f"## Agents ({len(agents)})", ""]
     for a in agents:
-        lines.append(
-            f"- **{a.get('name', 'Unnamed')}** — "
-            f"ID: `{a.get('id')}` | "
-            f"Model: {a.get('model', 'N/A')} | "
-            f"Version: {a.get('version', '?')} | "
-            f"Created: {a.get('created_at', 'N/A')}"
-        )
+        model_id = a.get("model", {}).get("id", "N/A") if isinstance(a.get("model"), dict) else str(a.get("model","N/A"))
+        lines.append(f"- **{a.get('name','Unnamed')}** — `{a.get('id')}` | {model_id}")
     return "\n".join(lines)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tool: cowork_start_session
-# ─────────────────────────────────────────────────────────────────────────────
-@mcp.tool(
-    name="cowork_start_session",
-    annotations={"title": "Start Cowork Workflow Session", "readOnlyHint": False},
-)
+@mcp.tool(name="cowork_start_session", annotations={"title":"Start Cowork Session"})
 async def cowork_start_session(params: StartSessionInput, ctx: Context) -> str:
-    """
-    Start a Managed Agent session to execute a Cowork workflow. Requires a
-    pre-created agent_id from cowork_create_agent.
-    """
+    """Start a Managed Agent session. agent_id must come from cowork_create_agent."""
     client = _client(ctx)
-
-    session_body: Dict[str, Any] = {"agent": params.agent_id}
-    if params.title:
-        session_body["title"] = params.title
-
-    await ctx.log_info("Creating session", {"agent_id": params.agent_id})
     await ctx.report_progress(0.2, "Creating session...")
-
     try:
-        resp = await client.post("/v1/sessions", json=session_body, headers=_headers())
-        resp.raise_for_status()
-        session = resp.json()
-    except Exception as exc:
-        return _err(exc, "Sessions API")
-
-    session_id = session.get("id", "")
-    await ctx.log_info("Session created", {"session_id": session_id})
-    await ctx.report_progress(0.5, "Sending task to agent...")
-
-    event_body: Dict[str, Any] = {
-        "type": "user",
-        "content": [{"type": "text", "text": params.task}],
-    }
-
+        resp = await client.post("/v1/sessions", headers=_headers(),
+            json={"agent": params.agent_id, **({"title":params.title} if params.title else {})})
+        resp.raise_for_status(); session = resp.json()
+    except Exception as exc: return _err(exc, "Sessions API")
+    sid = session.get("id","")
+    await ctx.report_progress(0.6, "Sending task...")
     try:
-        eresp = await client.post(
-            f"/v1/sessions/{session_id}/events",
-            json=event_body,
-            headers=_headers(),
-        )
-        eresp.raise_for_status()
+        er = await client.post(f"/v1/sessions/{sid}/events", headers=_headers(),
+            json={"type":"user","content":[{"type":"text","text":params.task}]})
+        er.raise_for_status()
     except Exception as exc:
-        return (
-            f"Session created (`{session_id}`) but failed to send task: {_err(exc, 'Events API')}\n"
-            f"Retry with cowork_send_event using session_id=`{session_id}`."
-        )
-
-    await ctx.report_progress(1.0, "Task sent — agent is running.")
-
-    lines = [
-        "## ✅ Cowork Workflow Session Started",
-        f"- **Session ID:** `{session_id}`  ← use with cowork_get_session_status",
-        f"- **Agent ID:** `{params.agent_id}`",
-        f"- **Status:** running",
-        f"- **Started:** {_utcnow()}",
-        "",
-        "The agent is running autonomously. "
-        "Call `cowork_get_session_status` to poll progress and read output.",
-    ]
-    if session.get("session_url"):
-        lines.insert(4, f"- **Live view:** {session['session_url']}")
+        return f"Session `{sid}` created but task failed: {_err(exc,'Events API')}"
+    await ctx.report_progress(1.0, "Running.")
+    lines = ["## ✅ Session Started", f"- **Session ID:** `{sid}`", f"- **Agent:** `{params.agent_id}`",
+             f"- **Started:** {_utcnow()}", "", "Poll with `cowork_get_session_status`."]
+    if session.get("session_url"): lines.insert(3, f"- **Live:** {session['session_url']}")
     return "\n".join(lines)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tool: cowork_get_session_status
-# ─────────────────────────────────────────────────────────────────────────────
-@mcp.tool(
-    name="cowork_get_session_status",
-    annotations={"title": "Get Session Status", "readOnlyHint": True},
-)
+@mcp.tool(name="cowork_get_session_status", annotations={"title":"Get Session Status","readOnlyHint":True})
 async def cowork_get_session_status(params: GetSessionInput, ctx: Context) -> str:
-    """
-    Poll the status and output of a running Cowork workflow session.
-    """
+    """Poll a session's status and recent output events."""
     client = _client(ctx)
-    await ctx.report_progress(0.2, "Fetching session...")
-
     try:
         resp = await client.get(f"/v1/sessions/{params.session_id}", headers=_headers())
-        resp.raise_for_status()
-        session = resp.json()
-    except Exception as exc:
-        return _err(exc, f"Session {params.session_id}")
-
-    await ctx.report_progress(0.6, "Fetching events...")
-
+        resp.raise_for_status(); session = resp.json()
+    except Exception as exc: return _err(exc, f"Session {params.session_id}")
     try:
-        eresp = await client.get(
-            f"/v1/sessions/{params.session_id}/events",
-            headers=_headers(),
-            params={"limit": params.max_events},
-        )
-        eresp.raise_for_status()
-        events: List[Dict[str, Any]] = eresp.json().get("data", [])
-    except Exception as exc:
-        events = []
-        await ctx.log_error("Events fetch failed", {"error": str(exc)})
-
-    await ctx.report_progress(1.0, "Done.")
-
-    status = session.get("status", "unknown")
-    icons = {"running": "⏳", "completed": "✅", "failed": "❌", "interrupted": "⚠️"}
-    icon = icons.get(status, "🔵")
-
-    lines = [
-        f"## {icon} Session `{params.session_id}`",
-        f"- **Status:** {status}",
-        f"- **Agent:** `{session.get('agent_id', 'N/A')}`",
-        f"- **Created:** {session.get('created_at', 'N/A')}",
-        f"- **Updated:** {session.get('updated_at', 'N/A')}",
-    ]
-    if session.get("session_url"):
-        lines.append(f"- **Live view:** {session['session_url']}")
-
+        er = await client.get(f"/v1/sessions/{params.session_id}/events",
+            headers=_headers(), params={"limit":params.max_events})
+        er.raise_for_status(); events = er.json().get("data",[])
+    except: events = []
+    st = session.get("status","?")
+    icon = {"running":"⏳","completed":"✅","failed":"❌","interrupted":"⚠️"}.get(st,"🔵")
+    lines = [f"## {icon} `{params.session_id}`", f"- **Status:** {st}",
+             f"- **Updated:** {session.get('updated_at','N/A')}"]
     if events:
-        lines += ["", f"### Recent Events ({len(events)})"]
+        lines += ["", f"### Events ({len(events)})"]
         for ev in events:
-            ev_type = ev.get("type", "?")
-            content = ev.get("content", [])
-            text = " ".join(
-                b.get("text", "")[:200]
-                for b in content
-                if isinstance(b, dict) and b.get("type") == "text"
-            )
-            if text:
-                lines.append(f"- **[{ev_type}]** {text}")
-            else:
-                lines.append(f"- **[{ev_type}]** *(non-text content)*")
-    else:
-        lines.append("\n_No events yet — agent may still be starting._")
-
+            text = " ".join(b.get("text","")[:200] for b in ev.get("content",[])
+                            if isinstance(b,dict) and b.get("type")=="text")
+            lines.append(f"- **[{ev.get('type','?')}]** {text or '*(non-text)*'}")
     return "\n".join(lines)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tool: cowork_send_event
-# ─────────────────────────────────────────────────────────────────────────────
-@mcp.tool(
-    name="cowork_send_event",
-    annotations={"title": "Send Event to Session", "readOnlyHint": False},
-)
+@mcp.tool(name="cowork_send_event", annotations={"title":"Send Event to Session"})
 async def cowork_send_event(params: SendEventInput, ctx: Context) -> str:
-    """
-    Send a follow-up message to a running session to steer the agent,
-    add context, or approve a proposed action.
-    """
+    """Send a follow-up message to steer a running session."""
     client = _client(ctx)
-    body: Dict[str, Any] = {
-        "type": "user",
-        "content": [{"type": "text", "text": params.message}],
-    }
-
     try:
-        resp = await client.post(
-            f"/v1/sessions/{params.session_id}/events",
-            json=body,
-            headers=_headers(),
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:
-        return _err(exc, f"Session {params.session_id}")
+        resp = await client.post(f"/v1/sessions/{params.session_id}/events", headers=_headers(),
+            json={"type":"user","content":[{"type":"text","text":params.message}]})
+        resp.raise_for_status(); data = resp.json()
+    except Exception as exc: return _err(exc, f"Session {params.session_id}")
+    return f"## ✅ Event Sent\n- **ID:** `{data.get('id','N/A')}`\n- **At:** {_utcnow()}"
 
-    return (
-        f"## ✅ Event Sent\n"
-        f"- **Session:** `{params.session_id}`\n"
-        f"- **Event ID:** `{data.get('id', 'N/A')}`\n"
-        f"- **Sent at:** {_utcnow()}"
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tool: cowork_list_sessions
-# ─────────────────────────────────────────────────────────────────────────────
-@mcp.tool(
-    name="cowork_list_sessions",
-    annotations={"title": "List Cowork Sessions", "readOnlyHint": True},
-)
+@mcp.tool(name="cowork_list_sessions", annotations={"title":"List Sessions","readOnlyHint":True})
 async def cowork_list_sessions(params: ListSessionsInput, ctx: Context) -> str:
-    """
-    List recent Managed Agent sessions with optional filtering.
-    """
+    """List recent Managed Agent sessions."""
     client = _client(ctx)
-    query: Dict[str, Any] = {"limit": params.limit}
-    if params.agent_id:
-        query["agent_id"] = params.agent_id
-    if params.status:
-        query["status"] = params.status
-
+    q = {"limit":params.limit, **({"agent_id":params.agent_id} if params.agent_id else {}),
+         **({"status":params.status} if params.status else {})}
     try:
-        resp = await client.get("/v1/sessions", headers=_headers(), params=query)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:
-        return _err(exc, "Sessions API")
-
-    sessions: List[Dict[str, Any]] = data.get("data", data.get("sessions", []))
-    if not sessions:
-        return "No sessions found."
-
-    icons = {"running": "⏳", "completed": "✅", "failed": "❌", "interrupted": "⚠️"}
-    lines = [f"## Sessions ({len(sessions)} found)", ""]
+        resp = await client.get("/v1/sessions", headers=_headers(), params=q)
+        resp.raise_for_status(); data = resp.json()
+    except Exception as exc: return _err(exc, "Sessions API")
+    sessions = data.get("data",[])
+    if not sessions: return "No sessions found."
+    icon = {"running":"⏳","completed":"✅","failed":"❌","interrupted":"⚠️"}
+    lines = [f"## Sessions ({len(sessions)})", ""]
     for s in sessions:
-        st = s.get("status", "?")
-        lines.append(
-            f"{icons.get(st,'🔵')} `{s.get('id')}` — **{st}** | "
-            f"agent: `{s.get('agent_id','?')}` | "
-            f"updated: {s.get('updated_at','N/A')}"
-        )
+        st = s.get("status","?")
+        lines.append(f"{icon.get(st,'🔵')} `{s.get('id')}` — **{st}** | {s.get('updated_at','N/A')}")
     return "\n".join(lines)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Health check route
-# ─────────────────────────────────────────────────────────────────────────────
-async def _health(request: Request) -> JSONResponse:
-    return JSONResponse({"status": "ok", "service": "cowork_trigger_mcp"})
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Entry point
-# ─────────────────────────────────────────────────────────────────────────────
+# ─── Entry point ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Build the MCP starlette sub-app
-    mcp_starlette = mcp.streamable_http_app()
+    mcp_app = mcp.streamable_http_app()   # route is /mcp
     session_mgr = mcp.session_manager
 
     @contextlib.asynccontextmanager
     async def lifespan(app):
         global _http_client
-        async with httpx.AsyncClient(
-            base_url=ANTHROPIC_BASE_URL,
-            timeout=REQUEST_TIMEOUT,
-            follow_redirects=True,
-        ) as client:
+        async with httpx.AsyncClient(base_url=ANTHROPIC_BASE_URL,
+                timeout=REQUEST_TIMEOUT, follow_redirects=True) as client:
             _http_client = client
-            logger.info("cowork_trigger_mcp started — model=%s", DEFAULT_MODEL)
+            logger.info("started — model=%s port=%d", DEFAULT_MODEL, MCP_PORT)
             async with session_mgr.run():
                 yield
         _http_client = None
-        logger.info("cowork_trigger_mcp shutting down.")
+        logger.info("shutdown.")
 
-    # Single mount point — no duplicate routes causing 307 redirects
-    outer = Starlette(
-        lifespan=lifespan,
-        routes=[
-            Route("/health", _health),
-            Mount("/mcp", app=mcp_starlette),
-        ],
-    )
+    # Health endpoint
+    async def health(request: Request) -> JSONResponse:
+        return JSONResponse({"status":"ok","service":"cowork_trigger_mcp","mcp_url":"/mcp"})
 
-    uvicorn.run(outer, host="0.0.0.0", port=MCP_PORT, log_level="info")
+    # ASGI app: health at / and /health, MCP app handles everything else
+    # (including /mcp and /mcp/ — we strip trailing slash before delegating)
+    async def root_app(scope, receive, send):
+        if scope["type"] == "lifespan":
+            # Run our lifespan manually
+            from starlette.applications import Starlette
+            sl = Starlette(lifespan=lifespan, routes=[])
+            await sl(scope, receive, send)
+            return
+
+        path = scope.get("path", "/")
+        # Normalise: /mcp/ → /mcp
+        if path != "/" and path.endswith("/"):
+            scope = dict(scope)
+            scope["path"] = path.rstrip("/")
+            scope["raw_path"] = scope["path"].encode()
+
+        if scope.get("type") == "http" and scope.get("path") in ("/", "/health"):
+            req = Request(scope, receive)
+            resp = await health(req)
+            await resp(scope, receive, send)
+        else:
+            await mcp_app(scope, receive, send)
+
+    uvicorn.run(root_app, host="0.0.0.0", port=MCP_PORT, log_level="info")
