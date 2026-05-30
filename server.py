@@ -136,9 +136,6 @@ class CreateAgentInput(BaseModel):
         description="Full system prompt describing the agent's role and behaviour.")
     model: Optional[str] = Field(default=None,
         description=f"Anthropic model ID. Defaults to {DEFAULT_MODEL}.")
-    enable_bash: bool = Field(default=True, description="Enable bash tool.")
-    enable_files: bool = Field(default=True, description="Enable file operations tool.")
-    enable_web_search: bool = Field(default=False, description="Enable web search tool.")
 
 
 class StartSessionInput(BaseModel):
@@ -223,19 +220,14 @@ async def cowork_create_agent(params: CreateAgentInput, ctx: Context) -> str:
     """
     client = _client(ctx)
 
-    tools = []
-    if params.enable_bash:
-        tools.append({"type": "bash_20250124", "name": "bash"})
-    if params.enable_files:
-        tools.append({"type": "text_editor_20250429", "name": "str_replace_based_edit_tool"})
-    if params.enable_web_search:
-        tools.append({"type": "web_search_20250305", "name": "web_search"})
-
+    # agent_toolset_20260401 is the single correct type that enables
+    # the full built-in toolset: bash, file ops, web search, web fetch, code execution.
+    # Individual tool type strings (bash_20250124 etc.) are NOT valid here.
     body: Dict[str, Any] = {
         "name": params.name,
         "model": params.model or DEFAULT_MODEL,
         "system": params.system_prompt,
-        "tools": tools,
+        "tools": [{"type": "agent_toolset_20260401"}],
     }
 
     await ctx.log_info("Creating agent", {"name": params.name})
