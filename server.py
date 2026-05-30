@@ -2,29 +2,20 @@
 """
 cowork_trigger_mcp — Production MCP Server
 ==========================================
-Provides tools to trigger and manage Cowork-style workflows programmatically
-using two official Anthropic APIs:
+Triggers Anthropic Cowork workflows via the Claude Managed Agents API.
 
-  1. Claude Managed Agents Sessions API  (POST /v1/sessions)
-     → the production API powering Cowork's autonomous execution
-     → beta header: managed-agents-2026-04-01
+CORRECT API FLOW (mandatory):
+  1. POST /v1/agents  — create agent ONCE, store agent_id
+  2. POST /v1/sessions — reference agent_id every run
+  3. POST /v1/sessions/{id}/events — send task to running session
+  4. GET  /v1/sessions/{id}/events — poll results
 
-  2. Claude Code Routines /fire endpoint  (POST /v1/claude_code/routines/{id}/fire)
-     → triggers pre-configured Claude Code Routines from external systems
-     → beta header: experimental-cc-routine-2026-04-01
+Key rules from official docs:
+  - Sessions take ONLY an agent ID pointer — no inline model/system/tools
+  - agents.create() is a setup step, NOT called per-run
+  - Beta header: managed-agents-2026-04-01
 
-Transport : Streamable HTTP (port 8080) — suitable for Render / Railway / Fly.io
-Auth      : ANTHROPIC_API_KEY via env var (never hardcoded)
-
-Tools exposed
-─────────────
-  cowork_create_agent          Create / register a reusable Managed Agent definition
-  cowork_start_session         Start a Managed Agent session (= trigger a Cowork workflow)
-  cowork_send_event            Send a follow-up message / steer a running session
-  cowork_get_session_status    Poll session status and read streamed events
-  cowork_list_sessions         List recent sessions with filtering
-  cowork_fire_routine          Fire a Claude Code Routine via its API trigger endpoint
-  cowork_list_agents           List registered Managed Agent definitions
+Transport: Streamable HTTP (port 8080) for Render.com deployment
 """
 
 import json
@@ -33,15 +24,18 @@ import os
 import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from enum import Enum
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 import httpx
+import uvicorn
 from mcp.server.fastmcp import FastMCP, Context
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Logging  (stderr only — never stdout for stdio-compatible servers)
+# Logging
 # ─────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     stream=sys.stderr,
@@ -51,436 +45,158 @@ logging.basicConfig(
 logger = logging.getLogger("cowork_trigger_mcp")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Configuration from environment
+# Config
 # ─────────────────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY: str = os.environ.get("ANTHROPIC_API_KEY", "")
-ANTHROPIC_BASE_URL: str = os.environ.get(
-    "ANTHROPIC_BASE_URL", "https://api.anthropic.com"
-)
+ANTHROPIC_BASE_URL: str = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
 ANTHROPIC_VERSION: str = "2023-06-01"
-
-# Beta headers
 MANAGED_AGENTS_BETA: str = "managed-agents-2026-04-01"
-ROUTINES_BETA: str = "experimental-cc-routine-2026-04-01"
-
-# Default model for new agent definitions
 DEFAULT_MODEL: str = os.environ.get("COWORK_DEFAULT_MODEL", "claude-sonnet-4-6")
-
 MCP_PORT: int = int(os.environ.get("MCP_PORT", "8080"))
 REQUEST_TIMEOUT: float = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "120"))
 
-# Validate at startup
 if not ANTHROPIC_API_KEY:
-    logger.error(
-        "ANTHROPIC_API_KEY is not set. "
-        "Export it before starting the server."
-    )
-
+    logger.error("ANTHROPIC_API_KEY is not set.")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Shared HTTP client (lifespan-managed, reused across all requests)
+# HTTP headers
 # ─────────────────────────────────────────────────────────────────────────────
-def _base_headers() -> Dict[str, str]:
+def _headers() -> Dict[str, str]:
     return {
         "x-api-key": ANTHROPIC_API_KEY,
         "anthropic-version": ANTHROPIC_VERSION,
+        "anthropic-beta": MANAGED_AGENTS_BETA,
         "content-type": "application/json",
     }
 
-
-def _managed_agents_headers() -> Dict[str, str]:
-    return {**_base_headers(), "anthropic-beta": MANAGED_AGENTS_BETA}
-
-
-def _routines_headers() -> Dict[str, str]:
-    return {**_base_headers(), "anthropic-beta": ROUTINES_BETA}
-
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Lifespan — shared HTTP client
+# ─────────────────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def app_lifespan(app: Any) -> AsyncIterator[Dict[str, Any]]:
-    """Create one shared AsyncClient for the server's lifetime."""
     async with httpx.AsyncClient(
         base_url=ANTHROPIC_BASE_URL,
         timeout=REQUEST_TIMEOUT,
         follow_redirects=True,
     ) as client:
-        logger.info(
-            "cowork_trigger_mcp started — base_url=%s model=%s",
-            ANTHROPIC_BASE_URL,
-            DEFAULT_MODEL,
-        )
+        logger.info("cowork_trigger_mcp started — model=%s", DEFAULT_MODEL)
         yield {"client": client}
     logger.info("cowork_trigger_mcp shutting down.")
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# MCP server  (port/host set here — run() does NOT accept these kwargs)
+# MCP server
 # ─────────────────────────────────────────────────────────────────────────────
 mcp = FastMCP(
     "cowork_trigger_mcp",
     lifespan=app_lifespan,
-    host="0.0.0.0",   # bind all interfaces — required for Render / Docker
+    host="0.0.0.0",
     port=MCP_PORT,
 )
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Shared utilities
+# Utilities
 # ─────────────────────────────────────────────────────────────────────────────
 def _client(ctx: Context) -> httpx.AsyncClient:
     return ctx.request_context.lifespan_state["client"]
 
-
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+def _fmt(data: Any) -> str:
+    return json.dumps(data, indent=2, default=str)
 
-def _handle_http_error(exc: Exception, resource: str = "resource") -> str:
-    """Convert httpx exceptions into actionable error strings."""
+def _err(exc: Exception, resource: str = "resource") -> str:
     if isinstance(exc, httpx.HTTPStatusError):
         code = exc.response.status_code
         try:
-            body = exc.response.json()
-            detail = body.get("error", {}).get("message", exc.response.text[:300])
+            detail = exc.response.json().get("error", {}).get("message", exc.response.text[:300])
         except Exception:
             detail = exc.response.text[:300]
-
-        if code == 401:
-            return (
-                "Error 401 Unauthorized: Check that ANTHROPIC_API_KEY is valid "
-                "and has not expired."
-            )
-        if code == 403:
-            return f"Error 403 Forbidden: Your API key does not have access to {resource}."
-        if code == 404:
-            return (
-                f"Error 404 Not Found: {resource} does not exist. "
-                "Verify the ID is correct."
-            )
-        if code == 422:
-            return f"Error 422 Unprocessable: {detail}"
-        if code == 429:
-            retry = exc.response.headers.get("retry-after", "unknown")
-            return f"Error 429 Rate Limited: retry after {retry}s."
-        if code >= 500:
-            return f"Error {code} Server Error: {detail}. Retry in a few seconds."
-        return f"Error {code}: {detail}"
+        hints = {
+            401: "Check ANTHROPIC_API_KEY is valid.",
+            403: f"API key lacks access to {resource}.",
+            404: f"{resource} not found — verify the ID.",
+            422: f"Invalid request body: {detail}",
+            429: f"Rate limited. Retry after {exc.response.headers.get('retry-after','?')}s.",
+        }
+        return f"Error {code}: {hints.get(code, detail)}"
     if isinstance(exc, httpx.TimeoutException):
-        return f"Error: Request timed out after {REQUEST_TIMEOUT}s. Retry or increase REQUEST_TIMEOUT_SECONDS."
-    if isinstance(exc, httpx.ConnectError):
-        return "Error: Cannot connect to Anthropic API. Check network/firewall."
+        return f"Timeout after {REQUEST_TIMEOUT}s — increase REQUEST_TIMEOUT_SECONDS."
     return f"Error ({type(exc).__name__}): {str(exc)[:300]}"
 
-
-def _fmt_json(data: Any) -> str:
-    return json.dumps(data, indent=2, default=str)
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Enums & shared input types
-# ─────────────────────────────────────────────────────────────────────────────
-class ResponseFormat(str, Enum):
-    MARKDOWN = "markdown"
-    JSON = "json"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Pydantic input models
+# Pydantic models
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CreateAgentInput(BaseModel):
-    """Input model for cowork_create_agent."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    name: str = Field(
-        ...,
-        description="Short human-readable name for this agent definition "
-                    "(e.g. 'Sales Report Agent', 'Contract Reviewer').",
-        min_length=3,
-        max_length=100,
-    )
-    system_prompt: str = Field(
-        ...,
-        description=(
-            "The agent's full system prompt. Describe its role, tools it may use, "
-            "output format, and any constraints. "
-            "Example: 'You are a financial analyst. Read spreadsheets, run Python "
-            "calculations, and produce a concise executive summary.'"
-        ),
-        min_length=20,
-        max_length=20000,
-    )
-    model: Optional[str] = Field(
-        default=None,
-        description=(
-            f"Anthropic model ID (e.g. 'claude-sonnet-4-6', 'claude-opus-4-6'). "
-            f"Defaults to {DEFAULT_MODEL}."
-        ),
-    )
-    tools: Optional[List[str]] = Field(
-        default=None,
-        description=(
-            "Built-in tools to enable. Options: 'bash', 'file_operations', "
-            "'web_search', 'web_fetch'. Leave null to enable all."
-        ),
-    )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="Output format: 'markdown' or 'json'.",
-    )
+    name: str = Field(..., min_length=3, max_length=100,
+        description="Name for this agent (e.g. 'Sales Report Agent').")
+    system_prompt: str = Field(..., min_length=20, max_length=20000,
+        description="Full system prompt describing the agent's role and behaviour.")
+    model: Optional[str] = Field(default=None,
+        description=f"Anthropic model ID. Defaults to {DEFAULT_MODEL}.")
+    enable_bash: bool = Field(default=True, description="Enable bash tool.")
+    enable_files: bool = Field(default=True, description="Enable file operations tool.")
+    enable_web_search: bool = Field(default=False, description="Enable web search tool.")
 
 
 class StartSessionInput(BaseModel):
-    """Input model for cowork_start_session."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    task: str = Field(
-        ...,
-        description=(
-            "Full natural-language description of the task this session should complete. "
-            "Be specific — include file paths, data sources, recipient names, "
-            "expected output format, and any deadline constraints.\n\n"
-            "Examples:\n"
-            "  • 'Read /data/q2_sales.xlsx, compute revenue by region, "
-            "and write a 300-word markdown summary to /out/q2_report.md'\n"
-            "  • 'Search the web for the latest GDPR enforcement actions in 2026 "
-            "and email a 5-bullet digest to legal@corp.com'"
-        ),
-        min_length=20,
-        max_length=8000,
-    )
-    agent_id: Optional[str] = Field(
-        default=None,
-        description=(
-            "ID of a pre-registered Managed Agent definition (from cowork_create_agent). "
-            "If omitted, an inline agent is created using system_prompt and model."
-        ),
-    )
-    system_prompt: Optional[str] = Field(
-        default=None,
-        description=(
-            "Inline system prompt when agent_id is not provided. "
-            "Required if agent_id is omitted."
-        ),
-        max_length=20000,
-    )
-    model: Optional[str] = Field(
-        default=None,
-        description=(
-            f"Model override (e.g. 'claude-opus-4-6'). "
-            f"Ignored when agent_id is set. Defaults to {DEFAULT_MODEL}."
-        ),
-    )
-    context: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description=(
-            "Optional key/value pairs injected into the task message as structured context "
-            "(e.g. {'customer_id': 'C-001', 'fiscal_year': 2026})."
-        ),
-    )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="Output format: 'markdown' or 'json'.",
-    )
+    agent_id: str = Field(..., min_length=5, max_length=128,
+        description="Agent ID from cowork_create_agent (e.g. 'agent_01ABC...'). "
+                    "Create one first — sessions require a pre-created agent.")
+    task: str = Field(..., min_length=10, max_length=8000,
+        description="Natural-language task for the agent to complete. Be specific.")
+    title: Optional[str] = Field(default=None, max_length=200,
+        description="Optional human-readable title for this session.")
 
     @field_validator("task")
     @classmethod
-    def task_must_not_be_blank(cls, v: str) -> str:
+    def task_not_blank(cls, v: str) -> str:
         if not v.strip():
             raise ValueError("task must not be blank.")
         return v.strip()
 
 
 class SendEventInput(BaseModel):
-    """Input model for cowork_send_event."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    session_id: str = Field(
-        ...,
-        description="Session ID returned by cowork_start_session.",
-        min_length=5,
-        max_length=128,
-    )
-    message: str = Field(
-        ...,
-        description=(
-            "Follow-up instruction or steering message sent to the running agent. "
-            "Use this to redirect, add context, or approve/deny a proposed action."
-        ),
-        min_length=1,
-        max_length=8000,
-    )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="Output format: 'markdown' or 'json'.",
-    )
+    session_id: str = Field(..., min_length=5, max_length=128,
+        description="Session ID from cowork_start_session.")
+    message: str = Field(..., min_length=1, max_length=8000,
+        description="Follow-up message to steer the running agent.")
 
 
-class GetSessionStatusInput(BaseModel):
-    """Input model for cowork_get_session_status."""
+class GetSessionInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-
-    session_id: str = Field(
-        ...,
-        description="Session ID returned by cowork_start_session.",
-        min_length=5,
-        max_length=128,
-    )
-    max_events: Optional[int] = Field(
-        default=20,
-        description="Maximum number of recent events to return (1–100).",
-        ge=1,
-        le=100,
-    )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="Output format: 'markdown' or 'json'.",
-    )
+    session_id: str = Field(..., min_length=5, max_length=128,
+        description="Session ID from cowork_start_session.")
+    max_events: int = Field(default=20, ge=1, le=100,
+        description="Max recent events to return.")
 
 
 class ListSessionsInput(BaseModel):
-    """Input model for cowork_list_sessions."""
     model_config = ConfigDict(extra="forbid")
-
-    agent_id: Optional[str] = Field(
-        default=None,
-        description="Filter by agent ID.",
-        max_length=128,
-    )
-    status: Optional[str] = Field(
-        default=None,
-        description="Filter by status: 'running', 'completed', 'failed', 'interrupted'.",
-        max_length=32,
-    )
-    limit: Optional[int] = Field(
-        default=20,
-        description="Maximum sessions to return (1–100).",
-        ge=1,
-        le=100,
-    )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="Output format: 'markdown' or 'json'.",
-    )
-
-
-class FireRoutineInput(BaseModel):
-    """Input model for cowork_fire_routine."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    routine_id: str = Field(
-        ...,
-        description=(
-            "Claude Code Routine ID from claude.ai/code/routines. "
-            "Format: trig_01XXXXXXXXXX (shown in the routine's detail page)."
-        ),
-        min_length=5,
-        max_length=128,
-    )
-    routine_bearer_token: str = Field(
-        ...,
-        description=(
-            "Dedicated bearer token for this routine. Generated once at creation "
-            "in the Routine detail page → 'Generate token'. Store securely — shown only once."
-        ),
-        min_length=10,
-        max_length=512,
-    )
-    additional_text: Optional[str] = Field(
-        default=None,
-        description=(
-            "Optional text appended to the routine's base prompt for this specific run. "
-            "Use to pass dynamic context (e.g. an alert payload, a file path, a ticket ID)."
-        ),
-        max_length=4000,
-    )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="Output format: 'markdown' or 'json'.",
-    )
+    agent_id: Optional[str] = Field(default=None,
+        description="Filter by agent ID.")
+    status: Optional[str] = Field(default=None,
+        description="Filter: 'running', 'completed', 'failed', 'interrupted'.")
+    limit: int = Field(default=20, ge=1, le=100)
 
 
 class ListAgentsInput(BaseModel):
-    """Input model for cowork_list_agents."""
     model_config = ConfigDict(extra="forbid")
-
-    limit: Optional[int] = Field(
-        default=20,
-        description="Maximum agents to return (1–100).",
-        ge=1,
-        le=100,
-    )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="Output format: 'markdown' or 'json'.",
-    )
+    limit: int = Field(default=20, ge=1, le=100)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Private API helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def _post(
-    client: httpx.AsyncClient,
-    path: str,
-    body: Dict[str, Any],
-    headers: Dict[str, str],
-) -> Dict[str, Any]:
-    resp = await client.post(path, json=body, headers=headers)
-    resp.raise_for_status()
-    return resp.json()
-
-
-async def _get(
-    client: httpx.AsyncClient,
-    path: str,
-    headers: Dict[str, str],
-    params: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    resp = await client.get(path, headers=headers, params=params)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def _build_inline_agent(system_prompt: str, model: Optional[str]) -> Dict[str, Any]:
-    """Inline agent definition embedded directly in the session request."""
-    return {
-        "model": model or DEFAULT_MODEL,
-        "system_prompt": system_prompt,
-        "tools": [
-            {"type": "bash"},
-            {"type": "file_operations"},
-            {"type": "web_search"},
-            {"type": "web_fetch"},
-        ],
-    }
-
-
-def _inject_context(task: str, context: Optional[Dict[str, Any]]) -> str:
-    """Append structured context to the task message."""
-    if not context:
-        return task
-    ctx_block = "\n\n**Context provided by caller:**\n" + "\n".join(
-        f"- `{k}`: {v}" for k, v in context.items()
-    )
-    return task + ctx_block
-
-
-def _format_session_md(data: Dict[str, Any]) -> str:
-    status = data.get("status", "unknown")
-    icon = {"running": "⏳", "completed": "✅", "failed": "❌", "interrupted": "⚠️"}.get(
-        status, "🔵"
-    )
-    lines = [
-        f"## {icon} Session `{data.get('id', 'N/A')}`",
-        f"- **Status:** {status}",
-        f"- **Agent:** {data.get('agent_id', 'inline')}",
-        f"- **Created:** {data.get('created_at', 'N/A')}",
-        f"- **Updated:** {data.get('updated_at', 'N/A')}",
-    ]
-    if data.get("session_url"):
-        lines.append(f"- **Live view:** {data['session_url']}")
-    return "\n".join(lines)
+class UpdateAgentInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    agent_id: str = Field(..., min_length=5, max_length=128,
+        description="Agent ID to update.")
+    system_prompt: Optional[str] = Field(default=None, max_length=20000,
+        description="New system prompt (creates a new version).")
+    name: Optional[str] = Field(default=None, max_length=100,
+        description="New agent name.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -488,81 +204,147 @@ def _format_session_md(data: Dict[str, Any]) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 @mcp.tool(
     name="cowork_create_agent",
-    annotations={
-        "title": "Create Cowork Agent Definition",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    },
+    annotations={"title": "Create Cowork Agent", "readOnlyHint": False},
 )
 async def cowork_create_agent(params: CreateAgentInput, ctx: Context) -> str:
     """
-    Register a reusable Managed Agent definition in the Anthropic platform.
-
-    Call this once to define an agent's model, system prompt, and tools.
-    The returned agent_id can be referenced by cowork_start_session across
-    multiple workflow runs without repeating the configuration each time.
+    Create a reusable Managed Agent definition. Do this ONCE and store the
+    returned agent_id — pass it to cowork_start_session for every workflow run.
 
     Args:
-        params (CreateAgentInput):
-            - name (str): Human-readable agent name (e.g. 'Contract Review Agent').
-            - system_prompt (str): Full system prompt for the agent.
-            - model (Optional[str]): Anthropic model ID (defaults to claude-sonnet-4-6).
-            - tools (Optional[List[str]]): Built-in tools to enable.
-            - response_format (ResponseFormat): 'markdown' or 'json'.
+        name: Human-readable agent name.
+        system_prompt: Full system prompt (role, behaviour, output format).
+        model: Anthropic model ID (default: claude-sonnet-4-6).
+        enable_bash: Allow the agent to run shell commands (default: true).
+        enable_files: Allow file read/write operations (default: true).
+        enable_web_search: Allow web search (default: false).
 
-    Returns:
-        str: Markdown or JSON containing the agent_id and creation metadata.
-        {
-            "id": str,            # agent_id — store this for cowork_start_session
-            "name": str,
-            "model": str,
-            "created_at": str
-        }
-
-    Error Handling:
-        - Error 401: ANTHROPIC_API_KEY invalid or missing.
-        - Error 422: Invalid request body — check system_prompt length and model name.
+    Returns agent_id — save this, you need it for every session.
     """
     client = _client(ctx)
-    await ctx.log_info("Creating agent definition", {"name": params.name})
 
-    tool_map = {
-        "bash": {"type": "bash"},
-        "file_operations": {"type": "file_operations"},
-        "web_search": {"type": "web_search"},
-        "web_fetch": {"type": "web_fetch"},
-    }
-    if params.tools:
-        tools = [tool_map[t] for t in params.tools if t in tool_map]
-    else:
-        tools = list(tool_map.values())
+    tools = []
+    if params.enable_bash:
+        tools.append({"type": "bash_20250124", "name": "bash"})
+    if params.enable_files:
+        tools.append({"type": "text_editor_20250429", "name": "str_replace_based_edit_tool"})
+    if params.enable_web_search:
+        tools.append({"type": "web_search_20250305", "name": "web_search"})
 
     body: Dict[str, Any] = {
         "name": params.name,
         "model": params.model or DEFAULT_MODEL,
-        "system_prompt": params.system_prompt,
+        "system": params.system_prompt,
         "tools": tools,
     }
 
+    await ctx.log_info("Creating agent", {"name": params.name})
     try:
-        data = await _post(client, "/v1/agents", body, _managed_agents_headers())
+        resp = await client.post("/v1/agents", json=body, headers=_headers())
+        resp.raise_for_status()
+        data = resp.json()
     except Exception as exc:
-        return _handle_http_error(exc, "Agents API")
+        return _err(exc, "Agents API")
 
-    await ctx.log_info("Agent created", {"id": data.get("id")})
-    await ctx.report_progress(1.0, "Agent created.")
-
-    if params.response_format == ResponseFormat.JSON:
-        return _fmt_json(data)
+    agent_id = data.get("id", "")
+    logger.info("Agent created: %s", agent_id)
 
     return "\n".join([
-        f"## ✅ Agent Created: {data.get('name', params.name)}",
-        f"- **Agent ID:** `{data.get('id')}`  ← save this for cowork_start_session",
-        f"- **Model:** {data.get('model', params.model or DEFAULT_MODEL)}",
+        "## ✅ Agent Created",
+        f"- **Agent ID:** `{agent_id}`  ← save this for cowork_start_session",
+        f"- **Name:** {data.get('name')}",
+        f"- **Model:** {data.get('model')}",
+        f"- **Version:** {data.get('version', 1)}",
         f"- **Created:** {data.get('created_at', _utcnow())}",
+        "",
+        "**Next step:** call `cowork_start_session` with this agent_id.",
     ])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool: cowork_update_agent
+# ─────────────────────────────────────────────────────────────────────────────
+@mcp.tool(
+    name="cowork_update_agent",
+    annotations={"title": "Update Cowork Agent", "readOnlyHint": False},
+)
+async def cowork_update_agent(params: UpdateAgentInput, ctx: Context) -> str:
+    """
+    Update an existing agent's system prompt or name. Each update creates a new
+    immutable version — existing sessions keep their pinned version.
+
+    Use this instead of creating a new agent when you want to change behaviour.
+
+    Args:
+        agent_id: Agent to update.
+        system_prompt: New system prompt (optional).
+        name: New agent name (optional).
+
+    Returns the new version number.
+    """
+    client = _client(ctx)
+    body: Dict[str, Any] = {}
+    if params.system_prompt:
+        body["system"] = params.system_prompt
+    if params.name:
+        body["name"] = params.name
+
+    if not body:
+        return "Error: Provide at least one of system_prompt or name to update."
+
+    try:
+        resp = await client.post(f"/v1/agents/{params.agent_id}", json=body, headers=_headers())
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        return _err(exc, f"Agent {params.agent_id}")
+
+    return "\n".join([
+        f"## ✅ Agent Updated: `{params.agent_id}`",
+        f"- **New version:** {data.get('version')}",
+        f"- **Updated:** {data.get('updated_at', _utcnow())}",
+        "",
+        "New sessions will use this version. Running sessions keep their pinned version.",
+    ])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool: cowork_list_agents
+# ─────────────────────────────────────────────────────────────────────────────
+@mcp.tool(
+    name="cowork_list_agents",
+    annotations={"title": "List Cowork Agents", "readOnlyHint": True},
+)
+async def cowork_list_agents(params: ListAgentsInput, ctx: Context) -> str:
+    """
+    List all Managed Agent definitions in your Anthropic organisation.
+    Use this to find agent IDs before calling cowork_start_session.
+
+    Args:
+        limit: Max agents to return (default 20).
+    """
+    client = _client(ctx)
+    try:
+        resp = await client.get("/v1/agents", headers=_headers(), params={"limit": params.limit})
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        return _err(exc, "Agents API")
+
+    agents: List[Dict[str, Any]] = data.get("data", data.get("agents", []))
+    if not agents:
+        return "No agents found. Create one with cowork_create_agent first."
+
+    lines = [f"## Registered Agents ({len(agents)} found)", ""]
+    for a in agents:
+        lines.append(
+            f"- **{a.get('name', 'Unnamed')}** — "
+            f"ID: `{a.get('id')}` | "
+            f"Model: {a.get('model', 'N/A')} | "
+            f"Version: {a.get('version', '?')} | "
+            f"Created: {a.get('created_at', 'N/A')}"
+        )
+    return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -570,107 +352,169 @@ async def cowork_create_agent(params: CreateAgentInput, ctx: Context) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 @mcp.tool(
     name="cowork_start_session",
-    annotations={
-        "title": "Start Cowork Workflow Session",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    },
+    annotations={"title": "Start Cowork Workflow Session", "readOnlyHint": False},
 )
 async def cowork_start_session(params: StartSessionInput, ctx: Context) -> str:
     """
-    Start a Claude Managed Agent session to execute a Cowork-style workflow.
+    Start a Managed Agent session to execute a Cowork workflow. Requires a
+    pre-created agent_id from cowork_create_agent.
 
-    This is the primary trigger tool. It creates a stateful agent session on
-    Anthropic's managed infrastructure, where Claude autonomously executes the
-    task using bash, file operations, web search, and any configured MCP tools.
-
-    Sessions are asynchronous — they run in the background. Use
-    cowork_get_session_status to poll progress and retrieve results.
+    The session is asynchronous — it runs in the background on Anthropic's
+    infrastructure. Use cowork_get_session_status to poll progress.
 
     Args:
-        params (StartSessionInput):
-            - task (str): Full natural-language task description.
-            - agent_id (Optional[str]): Pre-registered agent ID. If omitted,
-              system_prompt and model are used to create an inline agent.
-            - system_prompt (Optional[str]): Required if agent_id is omitted.
-            - model (Optional[str]): Model override (ignored if agent_id set).
-            - context (Optional[dict]): Key/value pairs injected into task message.
-            - response_format (ResponseFormat): 'markdown' or 'json'.
+        agent_id: From cowork_create_agent. REQUIRED — sessions cannot be
+                  created without a pre-existing agent.
+        task: Full natural-language task description. Be specific — include
+              file paths, data sources, expected output format.
+        title: Optional label for this session.
 
-    Returns:
-        str: Session metadata including session_id and live session_url.
-        {
-            "id": str,              # session_id — use with cowork_get_session_status
-            "status": str,          # 'running' initially
-            "session_url": str,     # Live view URL (claude.ai/code)
-            "created_at": str
-        }
+    Returns session_id — use with cowork_get_session_status.
 
     Examples:
-        - Trigger a sales report: task="Read /data/sales.xlsx and write a
-          markdown summary by region to /out/report.md"
-        - Summarise emails: task="Check my inbox, find unread messages from
-          the legal team this week, and draft a priority list"
-        - With agent_id: Use a pre-configured agent for consistent behaviour
-          across multiple workflow runs.
-
-    Error Handling:
-        - Error 401: ANTHROPIC_API_KEY invalid.
-        - Error 422: Missing system_prompt when agent_id not supplied.
-        - Error 429: Rate limit — retry after the indicated delay.
+        task="Read /data/sales.xlsx, compute revenue by region, write
+              markdown summary to /out/q2_report.md"
+        task="Search for GDPR enforcement actions in 2026 and summarise
+              the top 5 in bullet points"
     """
     client = _client(ctx)
 
-    if not params.agent_id and not params.system_prompt:
-        return (
-            "Error: Either agent_id or system_prompt must be provided. "
-            "Run cowork_create_agent first, or supply an inline system_prompt."
-        )
-
-    full_task = _inject_context(params.task, params.context)
-    await ctx.log_info("Starting session", {"task_preview": full_task[:120]})
-    await ctx.report_progress(0.10, "Sending session request to Anthropic…")
-
-    body: Dict[str, Any] = {
-        "input": {"text": full_task},
+    # Step 1: Create the session referencing the agent
+    session_body: Dict[str, Any] = {
+        "agent": params.agent_id,   # string shorthand = latest version
     }
+    if params.title:
+        session_body["title"] = params.title
 
-    if params.agent_id:
-        body["agent_id"] = params.agent_id
-    else:
-        body["agent"] = _build_inline_agent(
-            params.system_prompt or "",  # validated above
-            params.model,
-        )
+    await ctx.log_info("Creating session", {"agent_id": params.agent_id})
+    await ctx.report_progress(0.2, "Creating session...")
 
     try:
-        data = await _post(client, "/v1/sessions", body, _managed_agents_headers())
+        resp = await client.post("/v1/sessions", json=session_body, headers=_headers())
+        resp.raise_for_status()
+        session = resp.json()
     except Exception as exc:
-        return _handle_http_error(exc, "Sessions API")
+        return _err(exc, "Sessions API")
 
-    session_id = data.get("id", "")
-    session_url = data.get("session_url", "")
-    await ctx.log_info("Session started", {"id": session_id, "url": session_url})
-    await ctx.report_progress(1.0, "Session running.")
+    session_id = session.get("id", "")
+    await ctx.log_info("Session created", {"session_id": session_id})
+    await ctx.report_progress(0.5, "Sending task to agent...")
 
-    if params.response_format == ResponseFormat.JSON:
-        return _fmt_json(data)
+    # Step 2: Send the task as the first user event
+    event_body: Dict[str, Any] = {
+        "type": "user",
+        "content": [{"type": "text", "text": params.task}],
+    }
+
+    try:
+        eresp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json=event_body,
+            headers=_headers(),
+        )
+        eresp.raise_for_status()
+    except Exception as exc:
+        return (
+            f"Session created (`{session_id}`) but failed to send task: {_err(exc, 'Events API')}\n"
+            f"Retry with cowork_send_event using session_id=`{session_id}`."
+        )
+
+    await ctx.report_progress(1.0, "Task sent — agent is running.")
 
     lines = [
         "## ✅ Cowork Workflow Session Started",
         f"- **Session ID:** `{session_id}`  ← use with cowork_get_session_status",
-        f"- **Status:** {data.get('status', 'running')}",
-    ]
-    if session_url:
-        lines.append(f"- **Live view:** {session_url}")
-    lines += [
-        f"- **Started:** {data.get('created_at', _utcnow())}",
+        f"- **Agent ID:** `{params.agent_id}`",
+        f"- **Status:** running",
+        f"- **Started:** {_utcnow()}",
         "",
-        "The agent is now running autonomously. "
-        "Call `cowork_get_session_status` to poll progress.",
+        "The agent is running autonomously. "
+        "Call `cowork_get_session_status` to poll progress and read output.",
     ]
+    if session.get("session_url"):
+        lines.insert(4, f"- **Live view:** {session['session_url']}")
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool: cowork_get_session_status
+# ─────────────────────────────────────────────────────────────────────────────
+@mcp.tool(
+    name="cowork_get_session_status",
+    annotations={"title": "Get Session Status", "readOnlyHint": True},
+)
+async def cowork_get_session_status(params: GetSessionInput, ctx: Context) -> str:
+    """
+    Poll the status and output of a running Cowork workflow session.
+
+    Args:
+        session_id: From cowork_start_session.
+        max_events: Number of recent events to return (default 20).
+
+    Returns status ('running', 'completed', 'failed', 'interrupted')
+    and the latest agent output events.
+    """
+    client = _client(ctx)
+    await ctx.report_progress(0.2, "Fetching session...")
+
+    try:
+        resp = await client.get(
+            f"/v1/sessions/{params.session_id}",
+            headers=_headers(),
+        )
+        resp.raise_for_status()
+        session = resp.json()
+    except Exception as exc:
+        return _err(exc, f"Session {params.session_id}")
+
+    await ctx.report_progress(0.6, "Fetching events...")
+
+    try:
+        eresp = await client.get(
+            f"/v1/sessions/{params.session_id}/events",
+            headers=_headers(),
+            params={"limit": params.max_events},
+        )
+        eresp.raise_for_status()
+        events: List[Dict[str, Any]] = eresp.json().get("data", [])
+    except Exception as exc:
+        events = []
+        await ctx.log_error("Events fetch failed", {"error": str(exc)})
+
+    await ctx.report_progress(1.0, "Done.")
+
+    status = session.get("status", "unknown")
+    icons = {"running": "⏳", "completed": "✅", "failed": "❌", "interrupted": "⚠️"}
+    icon = icons.get(status, "🔵")
+
+    lines = [
+        f"## {icon} Session `{params.session_id}`",
+        f"- **Status:** {status}",
+        f"- **Agent:** `{session.get('agent_id', 'N/A')}`",
+        f"- **Created:** {session.get('created_at', 'N/A')}",
+        f"- **Updated:** {session.get('updated_at', 'N/A')}",
+    ]
+    if session.get("session_url"):
+        lines.append(f"- **Live view:** {session['session_url']}")
+
+    if events:
+        lines += ["", f"### Recent Events ({len(events)})"]
+        for ev in events:
+            ev_type = ev.get("type", "?")
+            # Extract text from content blocks
+            content = ev.get("content", [])
+            text = " ".join(
+                b.get("text", "")[:200]
+                for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+            if text:
+                lines.append(f"- **[{ev_type}]** {text}")
+            else:
+                lines.append(f"- **[{ev_type}]** *(non-text content)*")
+    else:
+        lines.append("\n_No events yet — agent may still be starting._")
+
     return "\n".join(lines)
 
 
@@ -679,174 +523,40 @@ async def cowork_start_session(params: StartSessionInput, ctx: Context) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 @mcp.tool(
     name="cowork_send_event",
-    annotations={
-        "title": "Send Event to Running Cowork Session",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    },
+    annotations={"title": "Send Event to Session", "readOnlyHint": False},
 )
 async def cowork_send_event(params: SendEventInput, ctx: Context) -> str:
     """
-    Send a follow-up message or steering instruction to a running Managed Agent session.
-
-    Use this to redirect the agent, add missing context, approve a proposed action,
-    or ask for clarification mid-execution.
+    Send a follow-up message to a running session to steer the agent,
+    add context, or approve a proposed action.
 
     Args:
-        params (SendEventInput):
-            - session_id (str): From cowork_start_session.
-            - message (str): Instruction, correction, or context to add.
-            - response_format (ResponseFormat): 'markdown' or 'json'.
-
-    Returns:
-        str: Acknowledgement from the Anthropic API confirming the event was queued.
-
-    Examples:
-        - "Focus only on EMEA data, ignore APAC"
-        - "The file is at /data/v2/report.csv not /data/report.csv"
-        - "Yes, proceed with the proposed change"
-
-    Error Handling:
-        - Error 404: session_id does not exist or session has already completed.
-        - Error 409: Session is not in a state that accepts new events.
+        session_id: From cowork_start_session.
+        message: Instruction or context to send to the agent.
     """
     client = _client(ctx)
-    path = f"/v1/sessions/{params.session_id}/events"
     body: Dict[str, Any] = {
         "type": "user",
         "content": [{"type": "text", "text": params.message}],
     }
 
     try:
-        data = await _post(client, path, body, _managed_agents_headers())
+        resp = await client.post(
+            f"/v1/sessions/{params.session_id}/events",
+            json=body,
+            headers=_headers(),
+        )
+        resp.raise_for_status()
+        data = resp.json()
     except Exception as exc:
-        return _handle_http_error(exc, f"Session {params.session_id}")
-
-    if params.response_format == ResponseFormat.JSON:
-        return _fmt_json(data)
+        return _err(exc, f"Session {params.session_id}")
 
     return (
-        f"## ✅ Event Sent to Session `{params.session_id}`\n"
+        f"## ✅ Event Sent\n"
+        f"- **Session:** `{params.session_id}`\n"
         f"- **Event ID:** `{data.get('id', 'N/A')}`\n"
-        f"- **Sent at:** {data.get('created_at', _utcnow())}\n\n"
-        "The agent will process your message in the next iteration."
+        f"- **Sent at:** {_utcnow()}"
     )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tool: cowork_get_session_status
-# ─────────────────────────────────────────────────────────────────────────────
-@mcp.tool(
-    name="cowork_get_session_status",
-    annotations={
-        "title": "Get Cowork Session Status and Events",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
-)
-async def cowork_get_session_status(
-    params: GetSessionStatusInput, ctx: Context
-) -> str:
-    """
-    Retrieve the current status and recent event history of a Managed Agent session.
-
-    Poll this tool to check whether a workflow started with cowork_start_session
-    has completed, is still running, or has failed. Returns the latest events
-    (tool calls, outputs, status messages) from the session's event stream.
-
-    Args:
-        params (GetSessionStatusInput):
-            - session_id (str): From cowork_start_session.
-            - max_events (Optional[int]): Number of recent events to return (default 20).
-            - response_format (ResponseFormat): 'markdown' or 'json'.
-
-    Returns:
-        str: Session status with the last N events from the event stream.
-        {
-            "id": str,
-            "status": str,           # 'running' | 'completed' | 'failed' | 'interrupted'
-            "created_at": str,
-            "updated_at": str,
-            "session_url": str,
-            "events": [              # Latest events, newest last
-                {
-                    "type": str,     # 'assistant' | 'tool_use' | 'tool_result' | 'user'
-                    "content": [...],
-                    "created_at": str
-                }
-            ]
-        }
-
-    Error Handling:
-        - Error 404: session_id does not exist.
-    """
-    client = _client(ctx)
-    await ctx.report_progress(0.20, "Fetching session metadata…")
-
-    try:
-        session = await _get(
-            client,
-            f"/v1/sessions/{params.session_id}",
-            _managed_agents_headers(),
-        )
-    except Exception as exc:
-        return _handle_http_error(exc, f"Session {params.session_id}")
-
-    await ctx.report_progress(0.60, "Fetching event stream…")
-
-    try:
-        events_resp = await _get(
-            client,
-            f"/v1/sessions/{params.session_id}/events",
-            _managed_agents_headers(),
-            params={"limit": params.max_events},
-        )
-        events: List[Dict[str, Any]] = events_resp.get("events", [])
-    except Exception as exc:
-        events = []
-        await ctx.log_error("Failed to fetch events", {"error": str(exc)})
-
-    await ctx.report_progress(1.0, "Done.")
-
-    combined = {**session, "events": events}
-
-    if params.response_format == ResponseFormat.JSON:
-        return _fmt_json(combined)
-
-    status = session.get("status", "unknown")
-    icon = {"running": "⏳", "completed": "✅", "failed": "❌", "interrupted": "⚠️"}.get(
-        status, "🔵"
-    )
-    lines = [
-        f"## {icon} Session Status: `{params.session_id}`",
-        f"- **Status:** {status}",
-        f"- **Created:** {session.get('created_at', 'N/A')}",
-        f"- **Updated:** {session.get('updated_at', 'N/A')}",
-    ]
-    if session.get("session_url"):
-        lines.append(f"- **Live view:** {session['session_url']}")
-
-    if events:
-        lines += ["", f"### Last {len(events)} Events"]
-        for ev in events[-params.max_events:]:
-            ev_type = ev.get("type", "unknown")
-            content_blocks = ev.get("content", [])
-            # Extract text from content blocks
-            text_parts = [
-                b.get("text", "")
-                for b in content_blocks
-                if isinstance(b, dict) and b.get("type") == "text"
-            ]
-            preview = " ".join(text_parts)[:300]
-            lines.append(f"- **[{ev_type}]** {preview}")
-    else:
-        lines.append("\n_No events recorded yet._")
-
-    return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -854,292 +564,57 @@ async def cowork_get_session_status(
 # ─────────────────────────────────────────────────────────────────────────────
 @mcp.tool(
     name="cowork_list_sessions",
-    annotations={
-        "title": "List Cowork Workflow Sessions",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
+    annotations={"title": "List Cowork Sessions", "readOnlyHint": True},
 )
 async def cowork_list_sessions(params: ListSessionsInput, ctx: Context) -> str:
     """
     List recent Managed Agent sessions with optional filtering.
 
-    Use this to get an overview of workflow runs, find specific sessions by
-    status, or audit what Cowork tasks have been executed recently.
-
     Args:
-        params (ListSessionsInput):
-            - agent_id (Optional[str]): Filter by agent definition ID.
-            - status (Optional[str]): Filter by 'running', 'completed', 'failed', 'interrupted'.
-            - limit (Optional[int]): Max sessions to return (default 20, max 100).
-            - response_format (ResponseFormat): 'markdown' or 'json'.
-
-    Returns:
-        str: Paginated list of sessions.
-        {
-            "sessions": [
-                {
-                    "id": str,
-                    "status": str,
-                    "agent_id": str,
-                    "created_at": str,
-                    "updated_at": str
-                }
-            ],
-            "count": int,
-            "has_more": bool
-        }
-
-    Error Handling:
-        - Error 401: Invalid API key.
+        agent_id: Filter by agent ID (optional).
+        status: Filter by 'running', 'completed', 'failed', 'interrupted' (optional).
+        limit: Max sessions to return (default 20).
     """
     client = _client(ctx)
-    query_params: Dict[str, Any] = {"limit": params.limit}
+    query: Dict[str, Any] = {"limit": params.limit}
     if params.agent_id:
-        query_params["agent_id"] = params.agent_id
+        query["agent_id"] = params.agent_id
     if params.status:
-        query_params["status"] = params.status
+        query["status"] = params.status
 
     try:
-        data = await _get(
-            client, "/v1/sessions", _managed_agents_headers(), params=query_params
-        )
-    except Exception as exc:
-        return _handle_http_error(exc, "Sessions API")
-
-    sessions: List[Dict[str, Any]] = data.get("sessions", data.get("data", []))
-    has_more: bool = data.get("has_more", False)
-
-    if params.response_format == ResponseFormat.JSON:
-        return _fmt_json({
-            "sessions": sessions,
-            "count": len(sessions),
-            "has_more": has_more,
-        })
-
-    if not sessions:
-        return "No sessions found matching the given filters."
-
-    lines = [f"## Cowork Sessions ({len(sessions)} returned, has_more={has_more})", ""]
-    status_icons = {
-        "running": "⏳", "completed": "✅", "failed": "❌", "interrupted": "⚠️"
-    }
-    for s in sessions:
-        st = s.get("status", "unknown")
-        icon = status_icons.get(st, "🔵")
-        lines.append(
-            f"{icon} `{s.get('id')}` — **{st}** | "
-            f"agent: `{s.get('agent_id', 'inline')}` | "
-            f"updated: {s.get('updated_at', 'N/A')}"
-        )
-    return "\n".join(lines)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tool: cowork_fire_routine
-# ─────────────────────────────────────────────────────────────────────────────
-@mcp.tool(
-    name="cowork_fire_routine",
-    annotations={
-        "title": "Fire a Claude Code Routine",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    },
-)
-async def cowork_fire_routine(params: FireRoutineInput, ctx: Context) -> str:
-    """
-    Trigger a pre-configured Claude Code Routine via its dedicated API endpoint.
-
-    Claude Code Routines are saved workflows (prompt + repo + connectors) that
-    run on Anthropic's cloud infrastructure. Each routine with an API trigger
-    has a unique HTTP endpoint and bearer token. Firing it starts a new
-    autonomous Claude Code session on Anthropic's servers.
-
-    Use this when you have already configured a Routine in claude.ai/code/routines
-    and want to trigger it programmatically (e.g. from a CI pipeline, monitoring
-    alert, or another agent).
-
-    Args:
-        params (FireRoutineInput):
-            - routine_id (str): From claude.ai/code/routines — the routine's trigger ID
-              (format: trig_01XXXXXXXXXX).
-            - routine_bearer_token (str): The per-routine bearer token generated at
-              creation time. Shown only once — store in a secret manager.
-            - additional_text (Optional[str]): Dynamic context appended to the routine's
-              base prompt (e.g. an alert payload, a ticket ID, a file path).
-            - response_format (ResponseFormat): 'markdown' or 'json'.
-
-    Returns:
-        str: Session metadata including session_id and session_url.
-        {
-            "claude_code_session_id": str,   # Use to track this run
-            "claude_code_session_url": str,  # Open in browser to watch live execution
-            "fired_at": str
-        }
-
-    Examples:
-        - Fire a nightly report routine for an ad-hoc run:
-            routine_id="trig_01ABC...", additional_text="Run for March 2026 instead of April"
-        - Trigger alert triage from a monitoring webhook:
-            routine_id="trig_01XYZ...", additional_text="Sentry alert SEN-4521: NullPointerException in prod"
-
-    Error Handling:
-        - Error 401: Invalid routine_bearer_token.
-        - Error 404: routine_id does not exist or API trigger is not enabled.
-        - Error 429: Daily run limit reached (Pro: 5/day, Max: 15/day, Team/Enterprise: 25/day).
-
-    Note:
-        The /fire endpoint is under beta header 'experimental-cc-routine-2026-04-01'.
-        Anthropic maintains backward compatibility for the two previous beta versions.
-    """
-    client = _client(ctx)
-    path = f"/v1/claude_code/routines/{params.routine_id}/fire"
-
-    # Routine requests use a per-routine bearer token, NOT the API key
-    headers = {
-        "Authorization": f"Bearer {params.routine_bearer_token}",
-        "anthropic-version": ANTHROPIC_VERSION,
-        "anthropic-beta": ROUTINES_BETA,
-        "content-type": "application/json",
-    }
-
-    body: Dict[str, Any] = {}
-    if params.additional_text:
-        body["text"] = params.additional_text
-
-    await ctx.log_info("Firing routine", {"routine_id": params.routine_id})
-    await ctx.report_progress(0.30, "Sending fire request…")
-
-    try:
-        resp = await client.post(path, json=body, headers=headers)
+        resp = await client.get("/v1/sessions", headers=_headers(), params=query)
         resp.raise_for_status()
         data = resp.json()
     except Exception as exc:
-        return _handle_http_error(exc, f"Routine {params.routine_id}")
+        return _err(exc, "Sessions API")
 
-    await ctx.report_progress(1.0, "Routine fired.")
+    sessions: List[Dict[str, Any]] = data.get("data", data.get("sessions", []))
+    if not sessions:
+        return "No sessions found."
 
-    session_id = data.get("claude_code_session_id", "")
-    session_url = data.get("claude_code_session_url", "")
-    fired_at = _utcnow()
-
-    if params.response_format == ResponseFormat.JSON:
-        return _fmt_json({**data, "fired_at": fired_at})
-
-    lines = [
-        f"## 🚀 Routine `{params.routine_id}` Fired",
-        f"- **Session ID:** `{session_id}`",
-    ]
-    if session_url:
-        lines.append(f"- **Live view:** {session_url}")
-    lines += [
-        f"- **Fired at:** {fired_at}",
-        "",
-        "Open the live view URL in your browser to watch execution in real time.",
-    ]
-    return "\n".join(lines)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tool: cowork_list_agents
-# ─────────────────────────────────────────────────────────────────────────────
-@mcp.tool(
-    name="cowork_list_agents",
-    annotations={
-        "title": "List Registered Cowork Agents",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
-)
-async def cowork_list_agents(params: ListAgentsInput, ctx: Context) -> str:
-    """
-    List all Managed Agent definitions registered in your Anthropic organisation.
-
-    Use this to discover existing agent IDs before calling cowork_start_session,
-    or to audit which agents have been created.
-
-    Args:
-        params (ListAgentsInput):
-            - limit (Optional[int]): Max agents to return (default 20, max 100).
-            - response_format (ResponseFormat): 'markdown' or 'json'.
-
-    Returns:
-        str: List of agent definitions.
-        {
-            "agents": [
-                {
-                    "id": str,        # Pass to cowork_start_session as agent_id
-                    "name": str,
-                    "model": str,
-                    "created_at": str
-                }
-            ],
-            "count": int
-        }
-
-    Error Handling:
-        - Error 401: Invalid API key.
-    """
-    client = _client(ctx)
-    try:
-        data = await _get(
-            client,
-            "/v1/agents",
-            _managed_agents_headers(),
-            params={"limit": params.limit},
-        )
-    except Exception as exc:
-        return _handle_http_error(exc, "Agents API")
-
-    agents: List[Dict[str, Any]] = data.get("agents", data.get("data", []))
-
-    if params.response_format == ResponseFormat.JSON:
-        return _fmt_json({"agents": agents, "count": len(agents)})
-
-    if not agents:
-        return (
-            "No agent definitions found. "
-            "Create one with cowork_create_agent first."
-        )
-
-    lines = [f"## Registered Cowork Agents ({len(agents)} found)", ""]
-    for agent in agents:
+    icons = {"running": "⏳", "completed": "✅", "failed": "❌", "interrupted": "⚠️"}
+    lines = [f"## Sessions ({len(sessions)} found)", ""]
+    for s in sessions:
+        st = s.get("status", "?")
         lines.append(
-            f"- **{agent.get('name', 'Unnamed')}** — "
-            f"ID: `{agent.get('id')}` | "
-            f"Model: {agent.get('model', 'N/A')} | "
-            f"Created: {agent.get('created_at', 'N/A')}"
+            f"{icons.get(st,'🔵')} `{s.get('id')}` — **{st}** | "
+            f"agent: `{s.get('agent_id','?')}` | "
+            f"updated: {s.get('updated_at','N/A')}"
         )
     return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-
+# Entry point — inject health route into MCP's Starlette app
 # ─────────────────────────────────────────────────────────────────────────────
-# Entry point — inject a health route into MCP's own Starlette app
-# ─────────────────────────────────────────────────────────────────────────────
-import uvicorn
-from starlette.requests import Request
-from starlette.responses import JSONResponse
-from starlette.routing import Route
-
-
 async def _health(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "service": "cowork_trigger_mcp"})
 
 
 if __name__ == "__main__":
-    # Get MCP's own Starlette app (has /mcp route built in)
     app = mcp.streamable_http_app()
-
-    # Inject health routes directly into MCP's route list
+    # Inject health check routes so Render.com HEAD / doesn't 404
     app.routes.insert(0, Route("/", _health))
     app.routes.insert(1, Route("/health", _health))
-
     uvicorn.run(app, host="0.0.0.0", port=MCP_PORT, log_level="info")
