@@ -110,9 +110,10 @@ def _err(exc: Exception, resource: str = "resource") -> str:
     if isinstance(exc, httpx.HTTPStatusError):
         code = exc.response.status_code
         try:
-            detail = exc.response.json().get("error", {}).get("message", exc.response.text[:300])
+            body = exc.response.json()
+            detail = body.get("error", {}).get("message", exc.response.text[:500])
         except Exception:
-            detail = exc.response.text[:300]
+            detail = exc.response.text[:500]
         hints = {
             401: "Check ANTHROPIC_API_KEY is valid.",
             403: f"API key lacks access to {resource}.",
@@ -120,10 +121,16 @@ def _err(exc: Exception, resource: str = "resource") -> str:
             422: f"Invalid request body: {detail}",
             429: f"Rate limited. Retry after {exc.response.headers.get('retry-after','?')}s.",
         }
-        return f"Error {code}: {hints.get(code, detail)}"
+        msg = f"Error {code}: {hints.get(code, detail)}"
+        logger.error("API error — %s — full body: %s", msg, exc.response.text[:1000])
+        return msg
     if isinstance(exc, httpx.TimeoutException):
-        return f"Timeout after {REQUEST_TIMEOUT}s — increase REQUEST_TIMEOUT_SECONDS."
-    return f"Error ({type(exc).__name__}): {str(exc)[:300]}"
+        msg = f"Timeout after {REQUEST_TIMEOUT}s — increase REQUEST_TIMEOUT_SECONDS."
+        logger.error(msg)
+        return msg
+    msg = f"Error ({type(exc).__name__}): {str(exc)[:300]}"
+    logger.error("Unexpected error: %s", msg)
+    return msg
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pydantic models
