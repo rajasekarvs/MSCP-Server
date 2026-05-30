@@ -1120,7 +1120,26 @@ async def cowork_list_agents(params: ListAgentsInput, ctx: Context) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Entry point
+
 # ─────────────────────────────────────────────────────────────────────────────
+# Entry point — inject a health route into MCP's own Starlette app
+# ─────────────────────────────────────────────────────────────────────────────
+import uvicorn
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+
+
+async def _health(request: Request) -> JSONResponse:
+    return JSONResponse({"status": "ok", "service": "cowork_trigger_mcp"})
+
+
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+    # Get MCP's own Starlette app (has /mcp route built in)
+    app = mcp.streamable_http_app()
+
+    # Inject health routes directly into MCP's route list
+    app.routes.insert(0, Route("/", _health))
+    app.routes.insert(1, Route("/health", _health))
+
+    uvicorn.run(app, host="0.0.0.0", port=MCP_PORT, log_level="info")
