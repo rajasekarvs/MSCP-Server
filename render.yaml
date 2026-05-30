@@ -1,0 +1,31 @@
+# render.yaml — Infrastructure as Code for cowork_trigger_mcp
+# Commit to your repo root.
+# In Render: New → Blueprint → connect repo → Apply.
+
+services:
+  - type: web
+    name: cowork-trigger-mcp
+    runtime: python
+    plan: starter                    # $7/month — always-on
+    region: oregon
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    healthCheckPath: /health
+    autoDeploy: true
+
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false                  # Render prompts you to enter value securely
+
+      - key: COWORK_DEFAULT_MODEL
+        value: claude-sonnet-4-6
+
+      - key: MCP_PORT
+        value: "8080"
+
+      - key: REQUEST_TIMEOUT_SECONDS
+        value: "120"
+
+      - key: PYTHON_VERSION
+        value: "3.12"
