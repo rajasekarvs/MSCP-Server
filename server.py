@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import sys
+import contextlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, Optional
@@ -30,9 +31,10 @@ import httpx
 import uvicorn
 from mcp.server.fastmcp import FastMCP, Context
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
-from starlette.routing import Route
+from starlette.routing import Route, Mount
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -70,36 +72,27 @@ def _headers() -> Dict[str, str]:
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Lifespan — shared HTTP client
+# Module-level HTTP client (initialized in outer lifespan)
 # ─────────────────────────────────────────────────────────────────────────────
-@asynccontextmanager
-async def app_lifespan(app: Any) -> AsyncIterator[Dict[str, Any]]:
-    async with httpx.AsyncClient(
-        base_url=ANTHROPIC_BASE_URL,
-        timeout=REQUEST_TIMEOUT,
-        follow_redirects=True,
-    ) as client:
-        logger.info("cowork_trigger_mcp started — model=%s", DEFAULT_MODEL)
-        yield {"client": client}
-    logger.info("cowork_trigger_mcp shutting down.")
+_http_client: Optional[httpx.AsyncClient] = None
+
+def _client(ctx: Context) -> httpx.AsyncClient:
+    assert _http_client is not None, "HTTP client not initialized — lifespan not running"
+    return _http_client
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MCP server
+# MCP server (no lifespan — handled by outer Starlette app)
 # ─────────────────────────────────────────────────────────────────────────────
 mcp = FastMCP(
     "cowork_trigger_mcp",
-    lifespan=app_lifespan,
     host="0.0.0.0",
     port=MCP_PORT,
-    streamable_http_path="/",   # serve at / so Claude.ai hits root directly
+    streamable_http_path="/",
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Utilities
 # ─────────────────────────────────────────────────────────────────────────────
-def _client(ctx: Context) -> httpx.AsyncClient:
-    return ctx.request_context.lifespan_state["client"]
-
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -215,22 +208,9 @@ async def cowork_create_agent(params: CreateAgentInput, ctx: Context) -> str:
     """
     Create a reusable Managed Agent definition. Do this ONCE and store the
     returned agent_id — pass it to cowork_start_session for every workflow run.
-
-    Args:
-        name: Human-readable agent name.
-        system_prompt: Full system prompt (role, behaviour, output format).
-        model: Anthropic model ID (default: claude-sonnet-4-6).
-        enable_bash: Allow the agent to run shell commands (default: true).
-        enable_files: Allow file read/write operations (default: true).
-        enable_web_search: Allow web search (default: false).
-
-    Returns agent_id — save this, you need it for every session.
     """
     client = _client(ctx)
 
-    # agent_toolset_20260401 is the single correct type that enables
-    # the full built-in toolset: bash, file ops, web search, web fetch, code execution.
-    # Individual tool type strings (bash_20250124 etc.) are NOT valid here.
     body: Dict[str, Any] = {
         "name": params.name,
         "model": params.model or DEFAULT_MODEL,
@@ -272,15 +252,6 @@ async def cowork_update_agent(params: UpdateAgentInput, ctx: Context) -> str:
     """
     Update an existing agent's system prompt or name. Each update creates a new
     immutable version — existing sessions keep their pinned version.
-
-    Use this instead of creating a new agent when you want to change behaviour.
-
-    Args:
-        agent_id: Agent to update.
-        system_prompt: New system prompt (optional).
-        name: New agent name (optional).
-
-    Returns the new version number.
     """
     client = _client(ctx)
     body: Dict[str, Any] = {}
@@ -319,9 +290,6 @@ async def cowork_list_agents(params: ListAgentsInput, ctx: Context) -> str:
     """
     List all Managed Agent definitions in your Anthropic organisation.
     Use this to find agent IDs before calling cowork_start_session.
-
-    Args:
-        limit: Max agents to return (default 20).
     """
     client = _client(ctx)
     try:
@@ -358,31 +326,10 @@ async def cowork_start_session(params: StartSessionInput, ctx: Context) -> str:
     """
     Start a Managed Agent session to execute a Cowork workflow. Requires a
     pre-created agent_id from cowork_create_agent.
-
-    The session is asynchronous — it runs in the background on Anthropic's
-    infrastructure. Use cowork_get_session_status to poll progress.
-
-    Args:
-        agent_id: From cowork_create_agent. REQUIRED — sessions cannot be
-                  created without a pre-existing agent.
-        task: Full natural-language task description. Be specific — include
-              file paths, data sources, expected output format.
-        title: Optional label for this session.
-
-    Returns session_id — use with cowork_get_session_status.
-
-    Examples:
-        task="Read /data/sales.xlsx, compute revenue by region, write
-              markdown summary to /out/q2_report.md"
-        task="Search for GDPR enforcement actions in 2026 and summarise
-              the top 5 in bullet points"
     """
     client = _client(ctx)
 
-    # Step 1: Create the session referencing the agent
-    session_body: Dict[str, Any] = {
-        "agent": params.agent_id,   # string shorthand = latest version
-    }
+    session_body: Dict[str, Any] = {"agent": params.agent_id}
     if params.title:
         session_body["title"] = params.title
 
@@ -400,7 +347,6 @@ async def cowork_start_session(params: StartSessionInput, ctx: Context) -> str:
     await ctx.log_info("Session created", {"session_id": session_id})
     await ctx.report_progress(0.5, "Sending task to agent...")
 
-    # Step 2: Send the task as the first user event
     event_body: Dict[str, Any] = {
         "type": "user",
         "content": [{"type": "text", "text": params.task}],
@@ -446,22 +392,12 @@ async def cowork_start_session(params: StartSessionInput, ctx: Context) -> str:
 async def cowork_get_session_status(params: GetSessionInput, ctx: Context) -> str:
     """
     Poll the status and output of a running Cowork workflow session.
-
-    Args:
-        session_id: From cowork_start_session.
-        max_events: Number of recent events to return (default 20).
-
-    Returns status ('running', 'completed', 'failed', 'interrupted')
-    and the latest agent output events.
     """
     client = _client(ctx)
     await ctx.report_progress(0.2, "Fetching session...")
 
     try:
-        resp = await client.get(
-            f"/v1/sessions/{params.session_id}",
-            headers=_headers(),
-        )
+        resp = await client.get(f"/v1/sessions/{params.session_id}", headers=_headers())
         resp.raise_for_status()
         session = resp.json()
     except Exception as exc:
@@ -501,7 +437,6 @@ async def cowork_get_session_status(params: GetSessionInput, ctx: Context) -> st
         lines += ["", f"### Recent Events ({len(events)})"]
         for ev in events:
             ev_type = ev.get("type", "?")
-            # Extract text from content blocks
             content = ev.get("content", [])
             text = " ".join(
                 b.get("text", "")[:200]
@@ -529,10 +464,6 @@ async def cowork_send_event(params: SendEventInput, ctx: Context) -> str:
     """
     Send a follow-up message to a running session to steer the agent,
     add context, or approve a proposed action.
-
-    Args:
-        session_id: From cowork_start_session.
-        message: Instruction or context to send to the agent.
     """
     client = _client(ctx)
     body: Dict[str, Any] = {
@@ -569,11 +500,6 @@ async def cowork_send_event(params: SendEventInput, ctx: Context) -> str:
 async def cowork_list_sessions(params: ListSessionsInput, ctx: Context) -> str:
     """
     List recent Managed Agent sessions with optional filtering.
-
-    Args:
-        agent_id: Filter by agent ID (optional).
-        status: Filter by 'running', 'completed', 'failed', 'interrupted' (optional).
-        limit: Max sessions to return (default 20).
     """
     client = _client(ctx)
     query: Dict[str, Any] = {"limit": params.limit}
@@ -606,46 +532,41 @@ async def cowork_list_sessions(params: ListSessionsInput, ctx: Context) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Entry point — inject health route into MCP's Starlette app
+# Health check route
 # ─────────────────────────────────────────────────────────────────────────────
 async def _health(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "service": "cowork_trigger_mcp"})
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import asyncio
-    import contextlib
-    import uvicorn
-    from starlette.applications import Starlette
-    from starlette.requests import Request
-    from starlette.responses import JSONResponse
-    from starlette.routing import Route, Mount
-
-    async def _health(request: Request) -> JSONResponse:
-        return JSONResponse({"status": "ok", "service": "cowork_trigger_mcp"})
-
-    # Build the MCP starlette sub-app (sets up routes at /)
+    # Build the MCP starlette sub-app
     mcp_starlette = mcp.streamable_http_app()
     session_mgr = mcp.session_manager
 
-    # Wrap in a Starlette app whose lifespan starts the session manager
-    # task group — this is the pattern documented in the MCP SDK source.
     @contextlib.asynccontextmanager
     async def lifespan(app):
-        async with session_mgr.run():
-            yield
+        global _http_client
+        async with httpx.AsyncClient(
+            base_url=ANTHROPIC_BASE_URL,
+            timeout=REQUEST_TIMEOUT,
+            follow_redirects=True,
+        ) as client:
+            _http_client = client
+            logger.info("cowork_trigger_mcp started — model=%s", DEFAULT_MODEL)
+            async with session_mgr.run():
+                yield
+        _http_client = None
+        logger.info("cowork_trigger_mcp shutting down.")
 
-    # Build outer Starlette app:
-    #   /health  → JSON health check (for Render)
-    #   /        → MCP app (serves at / because streamable_http_path="/")
-    #   /mcp     → same MCP app for clients that append /mcp
-    #   /mcp/    → same MCP app (no trailing slash redirect)
+    # Single mount point — no duplicate routes causing 307 redirects
     outer = Starlette(
         lifespan=lifespan,
         routes=[
             Route("/health", _health),
-            Route("/",       mcp_starlette, methods=["GET","POST","DELETE","PUT","PATCH"]),
-            Mount("/mcp",    app=mcp_starlette),
+            Mount("/mcp", app=mcp_starlette),
         ],
     )
 
