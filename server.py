@@ -27,8 +27,6 @@ Tools exposed
   cowork_list_agents           List registered Managed Agent definitions
 """
 
-from __future__ import annotations
-
 import json
 import logging
 import os
@@ -116,9 +114,14 @@ async def app_lifespan() -> AsyncIterator[Dict[str, Any]]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MCP server
+# MCP server  (port/host set here — run() does NOT accept these kwargs)
 # ─────────────────────────────────────────────────────────────────────────────
-mcp = FastMCP("cowork_trigger_mcp", lifespan=app_lifespan)
+mcp = FastMCP(
+    "cowork_trigger_mcp",
+    lifespan=app_lifespan,
+    host="0.0.0.0",   # bind all interfaces — required for Render / Docker
+    port=MCP_PORT,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1120,4 +1123,4 @@ async def cowork_list_agents(params: ListAgentsInput, ctx: Context) -> str:
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    mcp.run(transport="streamable_http", port=MCP_PORT)
+    mcp.run(transport="streamable-http")
