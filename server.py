@@ -91,6 +91,7 @@ mcp = FastMCP(
     lifespan=app_lifespan,
     host="0.0.0.0",
     port=MCP_PORT,
+    streamable_http_path="/",   # serve at / so Claude.ai hits root directly
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -605,8 +606,40 @@ async def _health(request: Request) -> JSONResponse:
 
 
 if __name__ == "__main__":
-    app = mcp.streamable_http_app()
-    # Inject health check routes so Render.com HEAD / doesn't 404
-    app.routes.insert(0, Route("/", _health))
-    app.routes.insert(1, Route("/health", _health))
-    uvicorn.run(app, host="0.0.0.0", port=MCP_PORT, log_level="info")
+    import asyncio
+    import contextlib
+    import uvicorn
+    from starlette.applications import Starlette
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route, Mount
+
+    async def _health(request: Request) -> JSONResponse:
+        return JSONResponse({"status": "ok", "service": "cowork_trigger_mcp"})
+
+    # Build the MCP starlette sub-app (sets up routes at /)
+    mcp_starlette = mcp.streamable_http_app()
+    session_mgr = mcp.session_manager
+
+    # Wrap in a Starlette app whose lifespan starts the session manager
+    # task group — this is the pattern documented in the MCP SDK source.
+    @contextlib.asynccontextmanager
+    async def lifespan(app):
+        async with session_mgr.run():
+            yield
+
+    # Build outer Starlette app:
+    #   /health  → JSON health check (for Render)
+    #   /        → MCP app (serves at / because streamable_http_path="/")
+    #   /mcp     → same MCP app for clients that append /mcp
+    #   /mcp/    → same MCP app (no trailing slash redirect)
+    outer = Starlette(
+        lifespan=lifespan,
+        routes=[
+            Route("/health", _health),
+            Route("/",       mcp_starlette, methods=["GET","POST","DELETE","PUT","PATCH"]),
+            Mount("/mcp",    app=mcp_starlette),
+        ],
+    )
+
+    uvicorn.run(outer, host="0.0.0.0", port=MCP_PORT, log_level="info")
