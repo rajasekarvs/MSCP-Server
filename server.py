@@ -97,7 +97,7 @@ def _routines_headers() -> Dict[str, str]:
 
 
 @asynccontextmanager
-async def app_lifespan() -> AsyncIterator[Dict[str, Any]]:
+async def app_lifespan(app: Any) -> AsyncIterator[Dict[str, Any]]:
     """Create one shared AsyncClient for the server's lifetime."""
     async with httpx.AsyncClient(
         base_url=ANTHROPIC_BASE_URL,
