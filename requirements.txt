@@ -1,0 +1,7 @@
+# cowork_trigger_mcp — Python dependencies
+# Pin minor versions for reproducible production builds.
+
+mcp[cli]>=1.9.0,<2.0.0          # FastMCP framework + streamable-HTTP transport
+httpx>=0.27.0,<0.28.0            # Async HTTP client
+pydantic>=2.7.0,<3.0.0           # Input validation
+uvicorn[standard]>=0.30.0,<1.0.0 # ASGI server used by streamable-HTTP transport
