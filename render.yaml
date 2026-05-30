@@ -11,7 +11,7 @@ services:
     branch: main
     buildCommand: pip install -r requirements.txt
     startCommand: python server.py
-    healthCheckPath: /health
+    # MCP endpoint is /mcp  (no /health route in this SDK version)
     autoDeploy: true
 
     envVars:
