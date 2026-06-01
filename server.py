@@ -30,6 +30,7 @@ def _headers():
             "anthropic-beta": "managed-agents-2026-04-01", "content-type": "application/json"}
 
 _http_client: Optional[httpx.AsyncClient] = None
+_environment_id: Optional[str] = None   # created once at startup
 
 def _client(ctx: Context) -> httpx.AsyncClient:
     assert _http_client is not None
@@ -64,6 +65,8 @@ class StartSessionInput(BaseModel):
     agent_id: str = Field(..., min_length=5, max_length=128, description="Agent ID from cowork_create_agent.")
     task: str = Field(..., min_length=10, max_length=8000, description="Task to complete.")
     title: Optional[str] = Field(default=None, max_length=200)
+    environment_id: Optional[str] = Field(default=None, max_length=128,
+        description="Environment ID. Leave blank to use the default shared environment.")
     @field_validator("task")
     @classmethod
     def not_blank(cls, v):
@@ -141,10 +144,20 @@ async def cowork_list_agents(params: ListAgentsInput, ctx: Context) -> str:
 async def cowork_start_session(params: StartSessionInput, ctx: Context) -> str:
     """Start a Managed Agent session. agent_id must come from cowork_create_agent."""
     client = _client(ctx)
+    # Resolve environment_id — use provided, else module-level default, else error
+    env_id = params.environment_id or _environment_id
+    if not env_id:
+        return ("Error: No environment_id available. "
+                "Call cowork_list_environments to find one, or restart the server "
+                "so it creates a default environment automatically.")
+
     await ctx.report_progress(0.2, "Creating session...")
     try:
-        resp = await client.post("/v1/sessions", headers=_headers(),
-            json={"agent": params.agent_id, **({"title":params.title} if params.title else {})})
+        resp = await client.post("/v1/sessions", headers=_headers(), json={
+            "agent": params.agent_id,
+            "environment_id": env_id,
+            **({"title": params.title} if params.title else {})
+        })
         resp.raise_for_status(); session = resp.json()
     except Exception as exc: return _err(exc, "Sessions API")
     sid = session.get("id","")
@@ -216,6 +229,23 @@ async def cowork_list_sessions(params: ListSessionsInput, ctx: Context) -> str:
         lines.append(f"{icon.get(st,'🔵')} `{s.get('id')}` — **{st}** | {s.get('updated_at','N/A')}")
     return "\n".join(lines)
 
+
+@mcp.tool(name="cowork_list_environments", annotations={"title":"List Environments","readOnlyHint":True})
+async def cowork_list_environments(ctx: Context) -> str:
+    """List available Managed Agent environments. Returns environment IDs needed for cowork_start_session."""
+    client = _client(ctx)
+    try:
+        resp = await client.get("/v1/environments", headers=_headers())
+        resp.raise_for_status(); data = resp.json()
+    except Exception as exc: return _err(exc, "Environments API")
+    envs = data.get("data", [])
+    if not envs: return "No environments found."
+    lines = [f"## Environments ({len(envs)})", "",
+             f"**Default environment ID:** `{envs[0].get('id')}` ← use this in cowork_start_session", ""]
+    for e in envs:
+        lines.append(f"- `{e.get('id')}` — {e.get('name','unnamed')} | status: {e.get('status','?')}")
+    return "\n".join(lines)
+
 # ─── Entry point ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     mcp_app = mcp.streamable_http_app()   # route is /mcp
@@ -223,14 +253,34 @@ if __name__ == "__main__":
 
     @contextlib.asynccontextmanager
     async def lifespan(app):
-        global _http_client
+        global _http_client, _environment_id
         async with httpx.AsyncClient(base_url=ANTHROPIC_BASE_URL,
                 timeout=REQUEST_TIMEOUT, follow_redirects=True) as client:
             _http_client = client
             logger.info("started — model=%s port=%d", DEFAULT_MODEL, MCP_PORT)
+
+            # Fetch or create the default environment at startup
+            try:
+                r = await client.get("/v1/environments", headers=_headers())
+                r.raise_for_status()
+                envs = r.json().get("data", [])
+                if envs:
+                    _environment_id = envs[0]["id"]
+                    logger.info("Using environment: %s", _environment_id)
+                else:
+                    # Create a default environment
+                    cr = await client.post("/v1/environments", headers=_headers(),
+                                          json={"name": "default"})
+                    cr.raise_for_status()
+                    _environment_id = cr.json()["id"]
+                    logger.info("Created environment: %s", _environment_id)
+            except Exception as exc:
+                logger.error("Could not fetch/create environment: %s", exc)
+
             async with session_mgr.run():
                 yield
         _http_client = None
+        _environment_id = None
         logger.info("shutdown.")
 
     # Health endpoint
